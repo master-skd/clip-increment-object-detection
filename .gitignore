@@ -1,0 +1,13 @@
+runs/
+checkpoints/
+train_task2_with_pseudo_labels_2d.json
+train_task2_with_pseudo_labels_3d.json
+train_task2_with_pseudo_labels_format.json
+train_task2_with_pseudo_labels.json
+datasets/embeddings/
+models/__pycache__/
+datasets/__pycache__/
+.dist_test/
+.ipynb_checkpoints/
+.vscode/
+tools/__pycache__
