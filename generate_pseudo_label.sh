@@ -4,5 +4,5 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch \
     --use_env \
     generate_pseudo_label.py \
     --launcher pytorch \
-    --score-thr 0.3 \
+    --score-thr 0.4 \
     --out train_task2_with_pseudo_labels_2d.json

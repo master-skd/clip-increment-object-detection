@@ -29,7 +29,7 @@ def parse_args():
 
     # === 基础路径（按你给的默认值）===
     parser.add_argument('--config', default='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask.py')
-    parser.add_argument('--checkpoint', default='runs/cat-seg/test_train_task1_10_2d_pseudo_label/epoch_38.pth')
+    parser.add_argument('--checkpoint', default='runs/cat-seg/test_train_task1_10_2d_pseudo_label/epoch_40.pth')
     parser.add_argument('--ann-file', default='/mnt/data14/yyg/datasets/Incremental/train_task_2.json')
     parser.add_argument('--img-prefix', default='/mnt/data14/yyg/datasets/MSCOCO/2017/train2017')
     parser.add_argument('--task1-classes', default='datasets/incremental_classes/task1_classes.json')

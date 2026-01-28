@@ -346,13 +346,12 @@ class CatSegMaskRoIHead(StandardRoIHead):
         # self.old_end = old_end          # 0-18 old => old_end=19
         # self.detach_old = detach_old    # True: 旧类通道不回传梯度
 
-    def _apply_mask_to_fpn(self, x_fpn, x_mask, topk_indices, x_fpn_old,
-            old_end):
+    def _apply_mask_to_fpn(self, x_fpn, x_mask, topk_indices=None, x_fpn_old=None, old_end=19):
         weighted_feats = []
         for lvl, lvl_new in enumerate(x_fpn):
             B, C, H, W = lvl_new.shape
 
-            # resize mask
+            # 1. Mask 处理
             if x_mask.shape[-2:] != (H, W):
                 mask_resized = F.interpolate(x_mask, size=(H, W), mode='bilinear', align_corners=False)
             else:
@@ -360,28 +359,25 @@ class CatSegMaskRoIHead(StandardRoIHead):
             # mask_resized = mask_resized.clamp(-10, 10)
             mask_sig = torch.sigmoid(mask_resized)
 
-            # if self.training and (topk_indices is not None):
-            #     # old_end: 旧类的 global class id 上界（< old_end 都算旧类）
-            #     old_sel = (topk_indices < old_end).to(mask_sig.dtype).view(B, -1, 1, 1)  # [B,K,1,1]
-            #     # 旧类通道用 detach 的 mask，新的通道正常反传
-            #     mask_sig = mask_sig * (1.0 - old_sel) + mask_sig.detach() * old_sel
+            # 2. 特征路由 (Hybrid Routing) - 关键回归
+            base_new = lvl_new.unsqueeze(1) # [B, 1, C, H, W]
 
-            # base feature for routing
-            base = lvl_new.unsqueeze(1).expand(B, x_mask.size(1), C, H, W)  # [B,K,C,H,W]
+            # 只有在提供了 Teacher FPN 且 提供了索引时，才启用替换
+            if (x_fpn_old is not None) and (topk_indices is not None):
+                lvl_old = x_fpn_old[lvl]
+                base_old = lvl_old.unsqueeze(1)
 
-            # if (x_fpn_old is not None) and (topk_indices is not None):
-            #     lvl_old = x_fpn_old[lvl]
-            #     base_old = lvl_old.unsqueeze(1)  # [B,1,C,H,W]
+                # 判定旧类 (Novel/Task1): indices < old_end
+                old_mask = (topk_indices < old_end).view(B, -1, 1, 1, 1)
+                
+                # === 核心逻辑 ===
+                # 旧类(Novel)强制用 Teacher -> 保证 AP 回到 20+
+                # 新类(Base)用 Student -> 保证学习新知识
+                base = torch.where(old_mask, base_old, base_new)
+            else:
+                base = base_new.expand(B, x_mask.size(1), C, H, W)
 
-            #     # old_mask: k 属于旧类
-            #     old_mask = (topk_indices < old_end).view(B, -1, 1, 1, 1)  # [B,K,1,1,1]
-
-            #     # per-k choose old/new base
-            #     base = torch.where(old_mask, base_old, base_new)          # [B,K,C,H,W]
-            # else:
-            #     base = base_new.expand(B, x_mask.size(1), C, H, W)        # [B,K,C,H,W]
-
-            weighted = base * mask_sig.unsqueeze(2)                       # [B,K,C,H,W]
+            weighted = base * mask_sig.unsqueeze(2)
             weighted_feats.append(rearrange(weighted, 'B K C H W -> B (K C) H W'))
 
         return tuple(weighted_feats)
@@ -422,8 +418,73 @@ class CatSegMaskRoIHead(StandardRoIHead):
 
         rois = bbox2roi([res.bboxes for res in sampling_results])
 
+        if (x_old is not None) and (cat_seg_logits_old is not None) and (teacher_indices is not None):
+            
+            with torch.no_grad():
+                # --- 1. 直接复用你的匹配逻辑 (完全照搬) ---
+                s_idx_exp = topk_indices.unsqueeze(2)
+                t_idx_exp = teacher_indices.unsqueeze(1)
+                match_matrix = (s_idx_exp == t_idx_exp)
+                is_old = s_idx_exp < old_end
+                valid_match = match_matrix & is_old
+                matches = torch.nonzero(valid_match, as_tuple=True)
+                b_idx, s_ch, t_ch = matches
+
+                # --- 2. 准备 Soft Protection Mask ---
+                # 初始化一个全 0 的 Mask [B, H, W]
+                # device 保持一致
+                B_size, _, H_size, W_size = cat_seg_logits_old.shape
+                spatial_protection_mask = torch.zeros((B_size, H_size, W_size), 
+                                                      device=cat_seg_logits_old.device)
+
+                if b_idx.numel() > 0:
+                    # 提取 Teacher 对应通道的 Mask Logits [N_match, H, W]
+                    t_mask_logits = cat_seg_logits_old[b_idx, t_ch]
+                    
+                    # 转为概率 (0~1) -> 这就是我们要的"软权重"
+                    t_mask_prob = torch.sigmoid(t_mask_logits)
+                    
+                    # --- 3. 聚合 Mask (Scatter Max) ---
+                    # 因为一个 batch 里可能匹配到多个旧类 (比如既有猫又有狗)
+                    # 我们取它们概率的最大值，作为该像素的最终保护力度
+                    
+                    # 为了效率，我们遍历本次 batch 中涉及到的 b_idx
+                    unique_b = torch.unique(b_idx)
+                    for b in unique_b:
+                        # 找到属于这个 sample 的所有匹配 mask
+                        mask_indices = (b_idx == b)
+                        probs_in_batch = t_mask_prob[mask_indices] # [M, H, W]
+                        
+                        # 取最大值: 只要任意一个旧类说这里是它，我们就保护这里
+                        if probs_in_batch.shape[0] > 0:
+                            max_prob, _ = probs_in_batch.max(dim=0)
+                            spatial_protection_mask[b] = max_prob
+                
+                # 增加通道维度 [B, H, W] -> [B, 1, H, W]
+                spatial_protection_mask = spatial_protection_mask.unsqueeze(1)
+
+            # --- 4. 定义 Soft Hook ---
+            def get_soft_gradient_mask_hook(mask_resized):
+                def hook(grad):
+                    # [关键改动] 软截断
+                    # grad * (1.0 - probability)
+                    # 概率越高，保留的梯度越少
+                    return grad * (1.0 - mask_resized)
+                return hook
+
+            # --- 5. 注册 Hook ---
+            new_x = []
+            for feat in x:
+                if feat.requires_grad:
+                    B, C, H, W = feat.shape
+                    # 插值到当前特征层大小
+                    mask_resized = F.interpolate(spatial_protection_mask, size=(H, W), mode='bilinear', align_corners=False).detach()
+                    # 注册
+                    feat.register_hook(get_soft_gradient_mask_hook(mask_resized))
+                new_x.append(feat)
+            x = tuple(new_x)
         # 传入cat_seg_feats
-        topk_indices = self._inject_gt_to_topk(topk_indices, gt_labels, k_old=5)
+        # topk_indices = self._inject_gt_to_topk(topk_indices, gt_labels, k_old=5)
         bbox_results = self._bbox_forward(x, rois, cat_seg_feats=cat_seg_feats, topk_indices=topk_indices, x_old=x_old, old_end=old_end)
         bbox_targets = self.bbox_head.get_targets(
             sampling_results, gt_bboxes, gt_labels, self.train_cfg)
@@ -435,77 +496,92 @@ class CatSegMaskRoIHead(StandardRoIHead):
         losses.update(loss_bbox)
 
         # 解耦一致性蒸馏(Decoupled Consistency Distillation)
-        if (x_old is not None) and (cat_seg_logits_old is not None) and (teacher_indices is not None):
-            # 1.匹配矩阵计算
-            # topk_indices: [B, K]
-            # teacher_indices: [B, K]
+        # if (x_old is not None) and (cat_seg_logits_old is not None) and (teacher_indices is not None):
+        #     # 1.匹配矩阵计算
+        #     # topk_indices: [B, K]
+        #     # teacher_indices: [B, K]
 
-            # 扩展维度以便广播对比 [B, K, 1] == [B, 1, K]
-            s_idx_exp = topk_indices.unsqueeze(2)
-            t_idx_exp = teacher_indices.unsqueeze(1)
+        #     # 扩展维度以便广播对比 [B, K, 1] == [B, 1, K]
+        #     s_idx_exp = topk_indices.unsqueeze(2)
+        #     t_idx_exp = teacher_indices.unsqueeze(1)
 
-            # 找到相同的类别id
-            # match_matrix[b, i, j]为True表示student的第i个通道和teacher的第j个通道是同一个类
-            match_matrix = (s_idx_exp == t_idx_exp)  # [B, K, K]
+        #     # 找到相同的类别id
+        #     # match_matrix[b, i, j]为True表示student的第i个通道和teacher的第j个通道是同一个类
+        #     match_matrix = (s_idx_exp == t_idx_exp)  # [B, K, K]
 
-            # 2.限制在旧类范围内(只蒸馏旧类)
-            is_old = s_idx_exp < old_end
-            valid_match = match_matrix & is_old  # [B, K, K]
+        #     # 2.限制在旧类范围内(只蒸馏旧类)
+        #     is_old = s_idx_exp < old_end
+        #     valid_match = match_matrix & is_old  # [B, K, K]
 
-            # 3. 提取匹配对索引
-            # matches: (batch_idx, student_channel_idx, teacher_channel_idx)
-            matches = torch.nonzero(valid_match, as_tuple=True)
-            b_idx, s_ch, t_ch = matches
+        #     # 3. 提取匹配对索引
+        #     # matches: (batch_idx, student_channel_idx, teacher_channel_idx)
+        #     matches = torch.nonzero(valid_match, as_tuple=True)
+        #     b_idx, s_ch, t_ch = matches
 
-            # 4. 计算Mask Loss
-            if b_idx.numel() > 0:
-                # student拿s_ch通道, teacher拿t_ch通道
-                s_mask_logits = cat_seg_feats[b_idx, s_ch]  # [num_matches, h, w]
-                t_mask_logits = cat_seg_logits_old[b_idx, t_ch]  # [num_matches, h, w]
+        #     # 4. 计算Mask Loss
+        #     if b_idx.numel() > 0:
+        #         # student拿s_ch通道, teacher拿t_ch通道
+        #         s_mask_logits = cat_seg_feats[b_idx, s_ch]  # [num_matches, h, w]
+        #         t_mask_logits = cat_seg_logits_old[b_idx, t_ch]  # [num_matches, h, w]
 
-                s_mask_prob = torch.sigmoid(s_mask_logits)
-                t_mask_prob = torch.sigmoid(t_mask_logits)
-                losses['loss_mask_kd'] = F.mse_loss(s_mask_prob, t_mask_prob) * 10.0
-            else:
-                losses['loss_mask_kd'] = cat_seg_feats.sum() * 0.0
+        #         # s_mask_prob = torch.sigmoid(s_mask_logits)
+        #         t_mask_prob = torch.sigmoid(t_mask_logits)
+        #         # losses['loss_mask_kd'] = F.mse_loss(s_mask_prob, t_mask_prob) * 100.0
+        #         loss_mask_kd = F.binary_cross_entropy_with_logits(s_mask_logits, t_mask_prob)
+        #         losses['loss_mask_kd'] = loss_mask_kd * 10.0
+        #     else:
+        #         losses['loss_mask_kd'] = cat_seg_feats.sum() * 0.0
 
-            # FPN蒸馏(按对应类别对齐Visual Features)
-            loss_fpn_kd = 0.
-            if b_idx.numel() > 0:
-                with torch.no_grad():
-                    # 我们不使用全局Max，而是根据匹配到的t_ch，把对应的Teacher mask拿出来
-                    # 只有这些区域才是Student正在关注且属于旧类的区域
+            # # FPN蒸馏(按对应类别对齐Visual Features)
+            # loss_fpn_kd = 0.
+            # if b_idx.numel() > 0:
+            #     with torch.no_grad():
+            #         # 我们不使用全局Max，而是根据匹配到的t_ch，把对应的Teacher mask拿出来
+            #         # 只有这些区域才是Student正在关注且属于旧类的区域
 
-                    # 取出匹配的Teacher mask [N_match, H, W]
-                    matched_masks = torch.sigmoid(cat_seg_logits_old[b_idx, t_ch])
+            #         # 取出匹配的Teacher mask [N_match, H, W]
+            #         matched_masks = torch.sigmoid(cat_seg_logits_old[b_idx, t_ch])
 
-                    # 我们需要把这些散落的mask还原回Batch维度[B, 1, H, W]
-                    B, _, H, W = cat_seg_logits_old.shape
-                    spatial_weight = torch.zeros((B, H, W), device=cat_seg_logits_old.device)
+            #         # 我们需要把这些散落的mask还原回Batch维度[B, 1, H, W]
+            #         B, _, H, W = cat_seg_logits_old.shape
+            #         spatial_weight = torch.zeros((B, H, W), device=cat_seg_logits_old.device)
 
-                    # 使用scatter_reduce将Mask聚合回对应的batch
-                    unique_b = torch.unique(b_idx)
-                    for b in unique_b:
-                        # 找到属于这个batch的所有匹配
-                        mask_indices = (b_idx == b)
-                        mask_in_batch = matched_masks[mask_indices]
-                        # 取最大值作为该batch的权重图
-                        if mask_in_batch.shape[0] > 0:
-                            spatial_weight[b], _ = mask_in_batch.max(dim=0)
-                    spatial_weight = spatial_weight.unsqueeze(1)  # [B,1,H,W]
+            #         # 使用scatter_reduce将Mask聚合回对应的batch
+            #         unique_b = torch.unique(b_idx)
+            #         for b in unique_b:
+            #             # 找到属于这个batch的所有匹配
+            #             mask_indices = (b_idx == b)
+            #             mask_in_batch = matched_masks[mask_indices]
+            #             # 取最大值作为该batch的权重图
+            #             if mask_in_batch.shape[0] > 0:
+            #                 spatial_weight[b], _ = mask_in_batch.max(dim=0)
+            #         spatial_weight = spatial_weight.unsqueeze(1)  # [B,1,H,W]
 
-                # 开始逐层蒸馏
-                for i, (feat_s, feat_t) in enumerate(zip(x, x_old)):
-                    B_f, C_f, H_f, W_f = feat_s.shape
-                    weight = F.interpolate(spatial_weight, size=(H_f, W_f), mode='bilinear', align_corners=False).detach()
-                    diff = (feat_s - feat_t) ** 2
-                    # 加权loss
-                    # 只有在matched teacher mask高亮的区域，才惩罚FPN的差异
-                    loss_level = (diff * weight).sum() / (weight.sum() * C_f + 1e-6)
-                    loss_fpn_kd += loss_level
-                losses['loss_fpn_kd'] = loss_fpn_kd * 5.0
-            else:
-                losses['loss_fpn_kd'] = x[0].sum() * 0.0
+            #     # 开始逐层蒸馏
+            #     for i, (feat_s, feat_t) in enumerate(zip(x, x_old)):
+            #         B_f, C_f, H_f, W_f = feat_s.shape
+            #         weight = F.interpolate(spatial_weight, size=(H_f, W_f), mode='bilinear', align_corners=False).detach()
+                    
+            #         # [修改 2] 使用 Cosine Similarity 替代 MSE
+            #         # CLIP 特征的核心是角度。MSE 过于严苛且数值不稳定。
+            #         # Cosine Loss = 1 - cos(a, b). 范围 [0, 2]
+                    
+            #         # Normalize (在 Channel 维度)
+            #         feat_s_norm = F.normalize(feat_s, dim=1)
+            #         feat_t_norm = F.normalize(feat_t, dim=1)
+                    
+            #         # 计算 Cosine Similarity [B, H, W]
+            #         cos_sim = (feat_s_norm * feat_t_norm).sum(dim=1, keepdim=True)
+                    
+            #         # Loss = (1 - cos) * weight
+            #         # 只有在旧物体区域，才要求方向一致
+            #         loss_level = ((1.0 - cos_sim) * weight).sum() / (weight.sum() + 1e-6)
+                    
+            #         loss_fpn_kd += loss_level
+            #     loss_fpn_kd /= len(x)  # 平均各层
+            #     losses['loss_fpn_kd'] = loss_fpn_kd * 5.0
+            # else:
+            #     losses['loss_fpn_kd'] = x[0].sum() * 0.0
 
         return losses
     
