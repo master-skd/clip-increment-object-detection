@@ -197,7 +197,7 @@ def main():
                     "bbox": [float(x1), float(y1), float(w), float(h)],
                     "area": float(w * h),
                     "iscrowd": 0,
-                    "ignore": True,
+                    # "ignore": True,
                     "score": float(score),
                     "is_pseudo": True
                 }

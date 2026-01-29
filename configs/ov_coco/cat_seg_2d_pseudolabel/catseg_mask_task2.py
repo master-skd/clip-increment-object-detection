@@ -107,6 +107,8 @@ model = dict(
             vlm_temperature=75.0,
             alpha=0.1,
             beta=0.8,
+            old_end=19,
+            is_incremental=True,
             class_embed='datasets/embeddings/coco_with_background_evaclip_vitb_16.pt',
             seen_classes='datasets/incremental_classes/task2_classes.json',
             all_classes='datasets/incremental_classes/task12_classes.json',
@@ -115,14 +117,14 @@ model = dict(
                 target_means=[0.0, 0.0, 0.0, 0.0],
                 target_stds=[0.1, 0.1, 0.2, 0.2],
             ),
-            # loss_cls=dict(
-            #     type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0
-            # ),
             loss_cls=dict(
-                type='CustomCrossEntropyLoss',
-                use_sigmoid=False,
-                loss_weight=1.0,
-                class_weight=class_weight),
+                type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0
+            ),
+            # loss_cls=dict(
+            #     type='CustomCrossEntropyLoss',
+            #     use_sigmoid=False,
+            #     loss_weight=1.0,
+            #     class_weight=class_weight),
             loss_bbox=dict(type='L1Loss', loss_weight=1.0),
             num_shared_convs=4,
             num_shared_fcs=2,
@@ -153,8 +155,8 @@ model = dict(
                 neg_iou_thr=0.3,
                 min_pos_iou=0.3,
                 match_low_quality=True,
-                ignore_iof_thr=0.5,
-                ignore_wrt_candidates=True
+                # ignore_iof_thr=0.5,
+                # ignore_wrt_candidates=True
             ),
             sampler=dict(
                 type='RandomSampler',
@@ -168,8 +170,8 @@ model = dict(
             debug=False
         ),
         rpn_proposal=dict(
-            nms_pre=2500,
-            max_per_img=1500,
+            nms_pre=2000,
+            max_per_img=1000,
             nms=dict(type='nms', iou_threshold=0.7),
             min_bbox_size=0
         ),
@@ -196,8 +198,8 @@ model = dict(
     
     test_cfg=dict(
         rpn=dict(
-            nms_pre=2500,
-            max_per_img=1500,
+            nms_pre=2000,
+            max_per_img=1000,
             nms=dict(type='nms', iou_threshold=0.7),
             min_bbox_size=0
         ),
