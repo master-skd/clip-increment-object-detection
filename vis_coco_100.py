@@ -44,10 +44,10 @@ def visualize_tasks(json_path, img_prefix, output_dir='vis_results', num_samples
             x, y, w, h = [int(v) for v in ann['bbox']]
             
             # 定义颜色 (BGR)
-            if 0 <= cat_id <= 18:
+            if 0 <= cat_id <= 39:
                 color = (0, 0, 255)  # Task 1: 红色
                 label = f"T1_{cat_id}"
-            elif 19 <= cat_id <= 40:
+            elif 40 <= cat_id <= 60:
                 color = (0, 255, 0)  # Task 2: 绿色
                 label = f"T2_{cat_id}"
             else:
@@ -63,7 +63,7 @@ def visualize_tasks(json_path, img_prefix, output_dir='vis_results', num_samples
     print(f"Done! Results saved in '{output_dir}'")
 
 # --- 配置参数 ---
-JSON_PATH = 'train_task2_with_pseudo_labels_2d.json'
+JSON_PATH = 'train_task3_with_pseudo_labels_2d.json'
 IMG_PREFIX = '/mnt/data14/yyg/datasets/MSCOCO/2017/train2017'
 
 visualize_tasks(JSON_PATH, IMG_PREFIX)

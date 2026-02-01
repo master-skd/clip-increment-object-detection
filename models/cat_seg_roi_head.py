@@ -776,94 +776,94 @@ class CatSegMaskBBoxHead(ConvFCBBoxHead):
         if learn_bg:
             self.bg_embedding = nn.Parameter(all_embed[:, -1:].clone().contiguous())
         
-        self.old_end = old_end
-        self.is_incremental = is_incremental
-        self.teacher_branch = None
-        if self.is_incremental:
-            # 此时 student 的权重可能还是随机的，没关系，我们先复制结构
-            # 这样 MMCV 就能监测到这些参数的存在，不会报错
-            self.teacher_branch = nn.ModuleDict({
-                'shared_convs': copy.deepcopy(self.shared_convs),
-                'shared_fcs': copy.deepcopy(self.shared_fcs),
-                'cls_convs': copy.deepcopy(self.cls_convs),
-                'cls_fcs': copy.deepcopy(self.cls_fcs)
-            })
+        # self.old_end = old_end
+        # self.is_incremental = is_incremental
+        # self.teacher_branch = None
+        # if self.is_incremental:
+        #     # 此时 student 的权重可能还是随机的，没关系，我们先复制结构
+        #     # 这样 MMCV 就能监测到这些参数的存在，不会报错
+        #     self.teacher_branch = nn.ModuleDict({
+        #         'shared_convs': copy.deepcopy(self.shared_convs),
+        #         'shared_fcs': copy.deepcopy(self.shared_fcs),
+        #         'cls_convs': copy.deepcopy(self.cls_convs),
+        #         'cls_fcs': copy.deepcopy(self.cls_fcs)
+        #     })
             
-            # 顺便直接把 Teacher 冻结住
-            self.teacher_branch.eval()
-            for param in self.teacher_branch.parameters():
-                param.requires_grad = False
+        #     # 顺便直接把 Teacher 冻结住
+        #     self.teacher_branch.eval()
+        #     for param in self.teacher_branch.parameters():
+        #         param.requires_grad = False
 
-    def init_weights(self):
-        super().init_weights()
+    # def init_weights(self):
+    #     super().init_weights()
 
-        # =======================================================
-        # 修改点 2: 这里只做权重数值的同步 (State Dict Copy)
-        # =======================================================
-        if self.is_incremental and self.teacher_branch is not None:
-            print(f"==> [CatSegHead] Incremental Mode: Syncing Teacher weights from initialized Student...")
+    #     # =======================================================
+    #     # 修改点 2: 这里只做权重数值的同步 (State Dict Copy)
+    #     # =======================================================
+    #     if self.is_incremental and self.teacher_branch is not None:
+    #         print(f"==> [CatSegHead] Incremental Mode: Syncing Teacher weights from initialized Student...")
             
-            # 使用 load_state_dict 把 Student 的权重值覆盖到 Teacher 上
-            self.teacher_branch['shared_convs'].load_state_dict(self.shared_convs.state_dict())
-            self.teacher_branch['shared_fcs'].load_state_dict(self.shared_fcs.state_dict())
-            self.teacher_branch['cls_convs'].load_state_dict(self.cls_convs.state_dict())
-            self.teacher_branch['cls_fcs'].load_state_dict(self.cls_fcs.state_dict())
+    #         # 使用 load_state_dict 把 Student 的权重值覆盖到 Teacher 上
+    #         self.teacher_branch['shared_convs'].load_state_dict(self.shared_convs.state_dict())
+    #         self.teacher_branch['shared_fcs'].load_state_dict(self.shared_fcs.state_dict())
+    #         self.teacher_branch['cls_convs'].load_state_dict(self.cls_convs.state_dict())
+    #         self.teacher_branch['cls_fcs'].load_state_dict(self.cls_fcs.state_dict())
             
-            print(f"==> [CatSegHead] Teacher weights synced and frozen.")
-        else:
-            print(f"==> [CatSegHead] Base Mode: No Teacher used.")
+    #         print(f"==> [CatSegHead] Teacher weights synced and frozen.")
+    #     else:
+    #         print(f"==> [CatSegHead] Base Mode: No Teacher used.")
 
-    def get_channel_mask(self, x, topk_indices):
-        """生成旧类通道掩码 (仅在 Incremental 模式下使用)"""
-        N, KC, H, W = x.shape
-        K = topk_indices.shape[1]
-        C = KC // K
-        is_old = topk_indices < self.old_end
-        mask_old = is_old.unsqueeze(-1).expand(-1, -1, C).reshape(N, -1)
-        mask_old = mask_old.view(N, KC, 1, 1).type_as(x)
-        return mask_old
+    # def get_channel_mask(self, x, topk_indices):
+    #     """生成旧类通道掩码 (仅在 Incremental 模式下使用)"""
+    #     N, KC, H, W = x.shape
+    #     K = topk_indices.shape[1]
+    #     C = KC // K
+    #     is_old = topk_indices < self.old_end
+    #     mask_old = is_old.unsqueeze(-1).expand(-1, -1, C).reshape(N, -1)
+    #     mask_old = mask_old.view(N, KC, 1, 1).type_as(x)
+    #     return mask_old
     
-    def forward_teacher(self, x):
-        """
-        Teacher 前向传播
-        修改：必须同时返回 cls_score 和 bbox_pred
-        """
-        # 1. Shared Parts
-        if self.num_shared_convs > 0:
-            for conv in self.teacher_branch['shared_convs']:
-                x = conv(x)
-        if self.num_shared_fcs > 0:
-            if self.with_avg_pool:
-                x = self.avg_pool(x)
-            x = x.flatten(1)
-            for fc in self.teacher_branch['shared_fcs']:
-                x = self.relu(fc(x))
+    # def forward_teacher(self, x):
+    #     """
+    #     Teacher 前向传播
+    #     修改：必须同时返回 cls_score 和 bbox_pred
+    #     """
+    #     # 1. Shared Parts
+    #     if self.num_shared_convs > 0:
+    #         for conv in self.teacher_branch['shared_convs']:
+    #             x = conv(x)
+    #     if self.num_shared_fcs > 0:
+    #         if self.with_avg_pool:
+    #             x = self.avg_pool(x)
+    #         x = x.flatten(1)
+    #         for fc in self.teacher_branch['shared_fcs']:
+    #             x = self.relu(fc(x))
         
-        # 2. Cls Branch
-        x_cls = x
-        for conv in self.teacher_branch['cls_convs']:
-            x_cls = conv(x_cls)
-        if x_cls.dim() > 2:
-            x_cls = x_cls.flatten(1)
-        for fc in self.teacher_branch['cls_fcs']:
-            x_cls = self.relu(fc(x_cls))
+    #     # 2. Cls Branch
+    #     x_cls = x
+    #     for conv in self.teacher_branch['cls_convs']:
+    #         x_cls = conv(x_cls)
+    #     if x_cls.dim() > 2:
+    #         x_cls = x_cls.flatten(1)
+    #     for fc in self.teacher_branch['cls_fcs']:
+    #         x_cls = self.relu(fc(x_cls))
             
-        # 3. Reg Branch (新增)
-        x_reg = x
-        # 假设 teacher 结构和 student 一样，也有 reg_convs/fcs
-        # 如果你的 teacher_branch 构建时没 copy reg部分，需要去 init 里加上
-        if 'reg_convs' in self.teacher_branch:
-             for conv in self.teacher_branch['reg_convs']:
-                x_reg = conv(x_reg)
-        if x_reg.dim() > 2:
-            if self.with_avg_pool:
-                x_reg = self.avg_pool(x_reg)
-            x_reg = x_reg.flatten(1)
-        if 'reg_fcs' in self.teacher_branch:
-            for fc in self.teacher_branch['reg_fcs']:
-                x_reg = self.relu(fc(x_reg))
+    #     # 3. Reg Branch (新增)
+    #     x_reg = x
+    #     # 假设 teacher 结构和 student 一样，也有 reg_convs/fcs
+    #     # 如果你的 teacher_branch 构建时没 copy reg部分，需要去 init 里加上
+    #     if 'reg_convs' in self.teacher_branch:
+    #          for conv in self.teacher_branch['reg_convs']:
+    #             x_reg = conv(x_reg)
+    #     if x_reg.dim() > 2:
+    #         if self.with_avg_pool:
+    #             x_reg = self.avg_pool(x_reg)
+    #         x_reg = x_reg.flatten(1)
+    #     if 'reg_fcs' in self.teacher_branch:
+    #         for fc in self.teacher_branch['reg_fcs']:
+    #             x_reg = self.relu(fc(x_reg))
 
-        return x_cls, x_reg
+    #     return x_cls, x_reg
 
     @property
     def all_embed(self):

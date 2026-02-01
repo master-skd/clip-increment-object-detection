@@ -1,9 +1,8 @@
 runs/
 checkpoints/
 train_task2_with_pseudo_labels_2d.json
-train_task2_with_pseudo_labels_3d.json
-train_task2_with_pseudo_labels_format.json
-train_task2_with_pseudo_labels.json
+train_task3_with_pseudo_labels_2d.json
+train_task4_with_pseudo_labels_2d.json
 datasets/embeddings/
 models/__pycache__/
 datasets/__pycache__/
