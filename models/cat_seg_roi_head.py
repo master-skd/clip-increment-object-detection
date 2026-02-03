@@ -383,6 +383,77 @@ class CatSegMaskRoIHead(StandardRoIHead):
 
         return tuple(weighted_feats)
 
+    def compute_roi_distillation_loss(self, student_results, teacher_results, old_end):
+        losses = {}
+        
+        # 1. 获取 Logits
+        s_cls_score = student_results['cls_score']
+        t_cls_score = teacher_results['cls_score']
+        
+        if s_cls_score is None or t_cls_score is None:
+            return losses
+
+        # 2. 截取旧类通道 (例如 0~18)
+        # 【关键】只拿出旧的前景类别，绝对不要包含背景通道！
+        # 如果包含背景，Teacher 会把新类物体当成背景，KL Loss 就会强迫 Student 也把它当背景。
+        s_logits_old = s_cls_score[:, :old_end]
+        t_logits_old = t_cls_score[:, :old_end]
+
+        # 3. 生成 Mask: 只蒸馏 Teacher "看懂了" (置信度高) 的样本
+        with torch.no_grad():
+            # 这里可以用 softmax 或 sigmoid 看 Teacher 对旧类的信心
+            # 既然我们要用 KL (Softmax)，这里用 Softmax 比较一致
+            t_probs_all = F.softmax(t_cls_score, dim=1) 
+            
+            # 拿到 Teacher 在旧类前景通道上的最大概率
+            # 注意：t_probs_all 包含了背景，我们看它是否觉得"是旧类前景"
+            t_max_prob, _ = t_probs_all[:, :old_end].max(dim=1)
+            
+            # 阈值筛选：只有 Teacher 确信这是旧类 (p > 0.4) 时，Student 才需要模仿
+            # 对于新类物体，Teacher 看到的旧类概率通常很低，会被过滤掉 -> 保护新类学习
+            valid_mask = t_max_prob > 0.5
+
+        # 4. 计算 KL Divergence Loss
+        if valid_mask.sum() > 0:
+            # T = 3.0  # 温度系数，KL 蒸馏的标配，让分布更平滑，关注暗知识
+            
+            # 取出有效样本
+            s_valid = s_logits_old[valid_mask]
+            t_valid = t_logits_old[valid_mask]
+
+            # Student 输出 Log Softmax
+            s_log_probs = F.log_softmax(s_valid, dim=1)
+            
+            # Teacher 输出 Softmax (作为 Target)
+            with torch.no_grad():
+                t_probs = F.softmax(t_valid, dim=1)
+
+            # 计算 KL Loss
+            # reduction='batchmean' 是 KL 散度的标准用法，会自动除以 batch size
+            loss_dist_cls = F.kl_div(s_log_probs, t_probs, reduction='batchmean')
+            
+            # 权重建议：KL Loss 的梯度通常比 MSE 柔和，可以给适当的权重 (如 2.0 ~ 5.0)
+            losses['loss_roi_dist_cls'] = loss_dist_cls * 1.0
+        else:
+            losses['loss_roi_dist_cls'] = s_logits_old.sum() * 0.0
+
+        # 5. 回归蒸馏 (保持不变，同样只针对有效样本)
+        # s_bbox_pred = student_results['bbox_pred']
+        # t_bbox_pred = teacher_results['bbox_pred']
+
+        # if s_bbox_pred is not None and t_bbox_pred is not None:
+        #      if s_bbox_pred.shape == t_bbox_pred.shape:
+        #         if valid_mask.sum() > 0:
+        #             loss_dist_bbox = F.smooth_l1_loss(
+        #                 s_bbox_pred[valid_mask], 
+        #                 t_bbox_pred[valid_mask]
+        #             )
+        #             losses['loss_roi_dist_bbox'] = loss_dist_bbox * 2.0
+        #         else:
+        #             losses['loss_roi_dist_bbox'] = s_bbox_pred.sum() * 0.0
+            
+        return losses
+
     def forward_train(self,
                       x,
                       img_metas,
@@ -397,6 +468,7 @@ class CatSegMaskRoIHead(StandardRoIHead):
                       x_old=None,
                       cat_seg_logits_old=None,
                       teacher_indices=None,
+                      teacher_roi_head=None,
                       old_end=19,
                       **kwargs):
         # 分配正负样本逻辑
@@ -496,93 +568,31 @@ class CatSegMaskRoIHead(StandardRoIHead):
         losses = dict()
         losses.update(loss_bbox)
 
-        # 解耦一致性蒸馏(Decoupled Consistency Distillation)
-        # if (x_old is not None) and (cat_seg_logits_old is not None) and (teacher_indices is not None):
-        #     # 1.匹配矩阵计算
-        #     # topk_indices: [B, K]
-        #     # teacher_indices: [B, K]
+        # 先初始化为 0 (防 DDP 报错)
+        pseudo_zero = bbox_results['cls_score'].sum() * 0.0
+        losses['loss_roi_dist_cls'] = pseudo_zero
+        # losses['loss_roi_dist_bbox'] = pseudo_zero
 
-        #     # 扩展维度以便广播对比 [B, K, 1] == [B, 1, K]
-        #     s_idx_exp = topk_indices.unsqueeze(2)
-        #     t_idx_exp = teacher_indices.unsqueeze(1)
-
-        #     # 找到相同的类别id
-        #     # match_matrix[b, i, j]为True表示student的第i个通道和teacher的第j个通道是同一个类
-        #     match_matrix = (s_idx_exp == t_idx_exp)  # [B, K, K]
-
-        #     # 2.限制在旧类范围内(只蒸馏旧类)
-        #     is_old = s_idx_exp < old_end
-        #     valid_match = match_matrix & is_old  # [B, K, K]
-
-        #     # 3. 提取匹配对索引
-        #     # matches: (batch_idx, student_channel_idx, teacher_channel_idx)
-        #     matches = torch.nonzero(valid_match, as_tuple=True)
-        #     b_idx, s_ch, t_ch = matches
-
-        #     # 4. 计算Mask Loss
-        #     if b_idx.numel() > 0:
-        #         # student拿s_ch通道, teacher拿t_ch通道
-        #         s_mask_logits = cat_seg_feats[b_idx, s_ch]  # [num_matches, h, w]
-        #         t_mask_logits = cat_seg_logits_old[b_idx, t_ch]  # [num_matches, h, w]
-
-        #         # s_mask_prob = torch.sigmoid(s_mask_logits)
-        #         t_mask_prob = torch.sigmoid(t_mask_logits)
-        #         # losses['loss_mask_kd'] = F.mse_loss(s_mask_prob, t_mask_prob) * 100.0
-        #         loss_mask_kd = F.binary_cross_entropy_with_logits(s_mask_logits, t_mask_prob)
-        #         losses['loss_mask_kd'] = loss_mask_kd * 10.0
-        #     else:
-        #         losses['loss_mask_kd'] = cat_seg_feats.sum() * 0.0
-
-            # # FPN蒸馏(按对应类别对齐Visual Features)
-            # loss_fpn_kd = 0.
-            # if b_idx.numel() > 0:
-            #     with torch.no_grad():
-            #         # 我们不使用全局Max，而是根据匹配到的t_ch，把对应的Teacher mask拿出来
-            #         # 只有这些区域才是Student正在关注且属于旧类的区域
-
-            #         # 取出匹配的Teacher mask [N_match, H, W]
-            #         matched_masks = torch.sigmoid(cat_seg_logits_old[b_idx, t_ch])
-
-            #         # 我们需要把这些散落的mask还原回Batch维度[B, 1, H, W]
-            #         B, _, H, W = cat_seg_logits_old.shape
-            #         spatial_weight = torch.zeros((B, H, W), device=cat_seg_logits_old.device)
-
-            #         # 使用scatter_reduce将Mask聚合回对应的batch
-            #         unique_b = torch.unique(b_idx)
-            #         for b in unique_b:
-            #             # 找到属于这个batch的所有匹配
-            #             mask_indices = (b_idx == b)
-            #             mask_in_batch = matched_masks[mask_indices]
-            #             # 取最大值作为该batch的权重图
-            #             if mask_in_batch.shape[0] > 0:
-            #                 spatial_weight[b], _ = mask_in_batch.max(dim=0)
-            #         spatial_weight = spatial_weight.unsqueeze(1)  # [B,1,H,W]
-
-            #     # 开始逐层蒸馏
-            #     for i, (feat_s, feat_t) in enumerate(zip(x, x_old)):
-            #         B_f, C_f, H_f, W_f = feat_s.shape
-            #         weight = F.interpolate(spatial_weight, size=(H_f, W_f), mode='bilinear', align_corners=False).detach()
-                    
-            #         # [修改 2] 使用 Cosine Similarity 替代 MSE
-            #         # CLIP 特征的核心是角度。MSE 过于严苛且数值不稳定。
-            #         # Cosine Loss = 1 - cos(a, b). 范围 [0, 2]
-                    
-            #         # Normalize (在 Channel 维度)
-            #         feat_s_norm = F.normalize(feat_s, dim=1)
-            #         feat_t_norm = F.normalize(feat_t, dim=1)
-                    
-            #         # 计算 Cosine Similarity [B, H, W]
-            #         cos_sim = (feat_s_norm * feat_t_norm).sum(dim=1, keepdim=True)
-                    
-            #         # Loss = (1 - cos) * weight
-            #         # 只有在旧物体区域，才要求方向一致
-            #         loss_level = ((1.0 - cos_sim) * weight).sum() / (weight.sum() + 1e-6)
-                    
-            #         loss_fpn_kd += loss_level
-            #     loss_fpn_kd /= len(x)  # 平均各层
-            #     losses['loss_fpn_kd'] = loss_fpn_kd * 5.0
-            # else:
-            #     losses['loss_fpn_kd'] = x[0].sum() * 0.0
+        if (teacher_roi_head is not None) and (x_old is not None):
+            with torch.no_grad():
+                # 移除 if distill_mask.any(): 判断
+                # 对所有 RoI 进行 Teacher 推理
+                teacher_bbox_results = teacher_roi_head._bbox_forward(
+                    x_old, 
+                    rois, 
+                    cat_seg_feats=cat_seg_logits_old,
+                    topk_indices=teacher_indices,
+                    old_end=old_end
+                )
+            
+            # 计算全样本 KL Loss
+            loss_dist = self.compute_roi_distillation_loss(
+                bbox_results, 
+                teacher_bbox_results, 
+                old_end
+            )
+            
+            losses.update(loss_dist)
 
         return losses
     
@@ -733,8 +743,8 @@ class CatSegMaskBBoxHead(ConvFCBBoxHead):
                  alpha=0.2,
                  beta=0.45,
                  
-                 old_end=None,
-                 is_incremental=False,
+                #  old_end=None,
+                #  is_incremental=False,
                  **kwargs):
         super().__init__(**kwargs)
 

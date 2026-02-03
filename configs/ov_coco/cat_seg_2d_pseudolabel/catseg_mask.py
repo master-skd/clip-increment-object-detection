@@ -78,7 +78,7 @@ model = dict(
             roi_feat_size=7,
             text_dim=512,
             num_classes=num_classes,
-            reg_class_agnostic=True,
+            reg_class_agnostic=False,
             norm_cfg=norm_cfg,
             # fixed_temperature=0,
             learn_bg=False,
@@ -192,7 +192,7 @@ resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0
 mp_start_method = 'fork'
-auto_scale_lr = dict(enable=True, base_batch_size=16)
+auto_scale_lr = dict(enable=False, base_batch_size=16)
 dataset_type = 'CocoDatasetOV'
 image_size = (384, 384)
 file_client_args = dict(backend='disk')
@@ -280,7 +280,7 @@ data = dict(
         pipeline=test_pipeline)
 )
 evaluation = dict(interval=1, metric=['bbox'])
-optimizer = dict(type='AdamW', lr=0.0001, betas=(0.9, 0.999), weight_decay=0.1)
+optimizer = dict(type='AdamW', lr=0.0004, betas=(0.9, 0.999), weight_decay=0.1)
 optimizer_config = dict(
     grad_clip=dict(max_norm=1.0, norm_type=2),
 )
@@ -292,9 +292,9 @@ lr_config = dict(
 
     warmup='linear',
     # warmup_iters=22376,  # 2张卡
-    warmup_iters=11192,  # 4张卡
+    warmup_iters=8394,  # 4张卡
     warmup_ratio=0.001,
     )
-runner = dict(type='EpochBasedRunner', max_epochs=40)
+runner = dict(type='EpochBasedRunner', max_epochs=30)
 # fp16 = dict(loss_scale=512.0)
 auto_resume = False

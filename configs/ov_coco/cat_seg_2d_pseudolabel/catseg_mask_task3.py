@@ -37,7 +37,7 @@ model = dict(
         out_indices=[3, 5, 7, 11],  # 输出中间层特征
         cat_seg_indices=[3, 7],
         pad_len=select_classes,
-        old_end=19,
+        old_end=40,
         k_old=5,
         norm_cfg=norm_cfg,
     ),
@@ -211,7 +211,7 @@ model = dict(
     )
 )
 
-checkpoint_config = dict(interval=1)
+checkpoint_config = dict(interval=5)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
@@ -324,6 +324,6 @@ lr_config = dict(
     warmup_iters=6992,  # 4张卡
     warmup_ratio=0.001,
     )
-runner = dict(type='EpochBasedRunner', max_epochs=40)
+runner = dict(type='EpochBasedRunner', max_epochs=30)
 # fp16 = dict(loss_scale=512.0)
 auto_resume = False

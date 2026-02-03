@@ -107,8 +107,8 @@ model = dict(
             vlm_temperature=75.0,
             alpha=0.1,
             beta=0.8,
-            old_end=19,
-            is_incremental=True,
+            # old_end=19,
+            # is_incremental=True,
             class_embed='datasets/embeddings/coco_with_background_evaclip_vitb_16.pt',
             seen_classes='datasets/incremental_classes/task2_classes.json',
             all_classes='datasets/incremental_classes/task12_classes.json',
@@ -211,7 +211,7 @@ model = dict(
     )
 )
 
-checkpoint_config = dict(interval=1)
+checkpoint_config = dict(interval=5)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
@@ -220,7 +220,7 @@ resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0
 mp_start_method = 'fork'
-auto_scale_lr = dict(enable=True, base_batch_size=16)
+auto_scale_lr = dict(enable=False, base_batch_size=16)
 dataset_type = 'CocoDatasetOV'
 image_size = (384, 384)
 file_client_args = dict(backend='disk')
@@ -309,7 +309,7 @@ data = dict(
         pipeline=test_pipeline)
 )
 evaluation = dict(interval=1, metric=['bbox'])
-optimizer = dict(type='AdamW', lr=0.0001, betas=(0.9, 0.999), weight_decay=0.1)
+optimizer = dict(type='AdamW', lr=0.0004, betas=(0.9, 0.999), weight_decay=0.1)
 optimizer_config = dict(
     grad_clip=dict(max_norm=1.0, norm_type=2),
 )
@@ -320,10 +320,10 @@ lr_config = dict(
     min_lr=1e-7,
 
     warmup='linear',
-    # warmup_iters=13976,  # 2张卡
-    warmup_iters=6992,  # 4张卡
+    # warmup_iters=10482,  # 2张卡
+    warmup_iters=3498,  # 4张卡
     warmup_ratio=0.001,
     )
-runner = dict(type='EpochBasedRunner', max_epochs=40)
+runner = dict(type='EpochBasedRunner', max_epochs=30)
 # fp16 = dict(loss_scale=512.0)
 auto_resume = False

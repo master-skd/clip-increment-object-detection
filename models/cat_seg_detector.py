@@ -136,7 +136,7 @@ class CatSegDetector(TwoStageDetector):
         
         loss_dist = 0.0
         # 蒸馏权重：建议设大一点 (5.0)，因为 RPN 是源头，且 BCE 数值通常较小
-        dist_weight = 5.0 
+        dist_weight = 1.0
 
         # 遍历 FPN 的每一层 (通常是 5 层)
         for s_cls, t_cls in zip(student_cls_scores, teacher_cls_scores):
@@ -192,6 +192,7 @@ class CatSegDetector(TwoStageDetector):
         cat_seg_logits_old = None
         teacher_indices = None
         teacher_rpn_outs = None
+        teacher_roi_head = None
 
         if self.use_feature_routing and (self.old_model is not None):
             with torch.no_grad():
@@ -200,9 +201,9 @@ class CatSegDetector(TwoStageDetector):
                 teacher_indices = res_feats_old[-2]
                 fpn_inputs_old = res_feats_old[:-3]
                 x_old = self.old_model.neck(fpn_inputs_old) if self.old_model.with_neck else fpn_inputs_old
-
                 if self.old_model.with_rpn:
                     teacher_rpn_outs = self.old_model.rpn_head(x_old)
+                teacher_roi_head = self.old_model.roi_head
         
         losses = dict()
 
@@ -217,10 +218,8 @@ class CatSegDetector(TwoStageDetector):
                                                                     proposal_cfg,
                                                                     **kwargs)
             losses.update(rpn_losses)
-
             if teacher_rpn_outs is not None:
                 student_rpn_outs = self.rpn_head(x)
-                
                 # 调用辅助函数计算蒸馏
                 loss_rpn_dist = self.compute_rpn_distillation_loss(student_rpn_outs, teacher_rpn_outs)
                 losses.update(loss_rpn_dist)
@@ -252,7 +251,7 @@ class CatSegDetector(TwoStageDetector):
                                                  x_old=x_old,
                                                  cat_seg_logits_old=cat_seg_logits_old,
                                                  teacher_indices=teacher_indices,
-
+                                                 teacher_roi_head=teacher_roi_head,
                                                  old_end=self.old_end,
                                                  **kwargs)
         losses.update(roi_losses)
