@@ -321,7 +321,8 @@ lr_config = dict(
 
     warmup='linear',
     # warmup_iters=10482,  # 2张卡
-    warmup_iters=3498,  # 4张卡
+    # warmup_iters=3498,  # 6张卡
+    warmup_iters=5244,
     warmup_ratio=0.001,
     )
 runner = dict(type='EpochBasedRunner', max_epochs=30)

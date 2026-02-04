@@ -383,75 +383,110 @@ class CatSegMaskRoIHead(StandardRoIHead):
 
         return tuple(weighted_feats)
 
+    # def compute_roi_distillation_loss(self, student_results, teacher_results, old_end):
+    #     losses = {}
+        
+    #     # 1. 获取 Logits
+    #     s_cls_score = student_results['cls_score']
+    #     t_cls_score = teacher_results['cls_score']
+        
+    #     if s_cls_score is None or t_cls_score is None:
+    #         return losses
+
+    #     # 2. 截取旧类通道 (例如 0~18)
+    #     # 【关键】只拿出旧的前景类别，绝对不要包含背景通道！
+    #     # 如果包含背景，Teacher 会把新类物体当成背景，KL Loss 就会强迫 Student 也把它当背景。
+    #     s_logits_old = s_cls_score[:, :old_end]
+    #     t_logits_old = t_cls_score[:, :old_end]
+
+    #     # 3. 生成 Mask: 只蒸馏 Teacher "看懂了" (置信度高) 的样本
+    #     with torch.no_grad():
+    #         # 这里可以用 softmax 或 sigmoid 看 Teacher 对旧类的信心
+    #         # 既然我们要用 KL (Softmax)，这里用 Softmax 比较一致
+    #         t_probs_all = F.softmax(t_cls_score, dim=1) 
+            
+    #         # 拿到 Teacher 在旧类前景通道上的最大概率
+    #         # 注意：t_probs_all 包含了背景，我们看它是否觉得"是旧类前景"
+    #         t_max_prob, _ = t_probs_all[:, :old_end].max(dim=1)
+            
+    #         # 阈值筛选：只有 Teacher 确信这是旧类 (p > 0.4) 时，Student 才需要模仿
+    #         # 对于新类物体，Teacher 看到的旧类概率通常很低，会被过滤掉 -> 保护新类学习
+    #         valid_mask = t_max_prob > 0.5
+
+    #     # 4. 计算 KL Divergence Loss
+    #     if valid_mask.sum() > 0:
+    #         # T = 3.0  # 温度系数，KL 蒸馏的标配，让分布更平滑，关注暗知识
+            
+    #         # 取出有效样本
+    #         s_valid = s_logits_old[valid_mask]
+    #         t_valid = t_logits_old[valid_mask]
+
+    #         # Student 输出 Log Softmax
+    #         s_log_probs = F.log_softmax(s_valid, dim=1)
+            
+    #         # Teacher 输出 Softmax (作为 Target)
+    #         with torch.no_grad():
+    #             t_probs = F.softmax(t_valid, dim=1)
+
+    #         # 计算 KL Loss
+    #         # reduction='batchmean' 是 KL 散度的标准用法，会自动除以 batch size
+    #         loss_dist_cls = F.kl_div(s_log_probs, t_probs, reduction='batchmean')
+            
+    #         # 权重建议：KL Loss 的梯度通常比 MSE 柔和，可以给适当的权重 (如 2.0 ~ 5.0)
+    #         losses['loss_roi_dist_cls'] = loss_dist_cls * 1.0
+    #     else:
+    #         losses['loss_roi_dist_cls'] = s_logits_old.sum() * 0.0
+
+    #     # 5. 回归蒸馏 (保持不变，同样只针对有效样本)
+    #     # s_bbox_pred = student_results['bbox_pred']
+    #     # t_bbox_pred = teacher_results['bbox_pred']
+
+    #     # if s_bbox_pred is not None and t_bbox_pred is not None:
+    #     #      if s_bbox_pred.shape == t_bbox_pred.shape:
+    #     #         if valid_mask.sum() > 0:
+    #     #             loss_dist_bbox = F.smooth_l1_loss(
+    #     #                 s_bbox_pred[valid_mask], 
+    #     #                 t_bbox_pred[valid_mask]
+    #     #             )
+    #     #             losses['loss_roi_dist_bbox'] = loss_dist_bbox * 2.0
+    #     #         else:
+    #     #             losses['loss_roi_dist_bbox'] = s_bbox_pred.sum() * 0.0
+            
+    #     return losses
+
     def compute_roi_distillation_loss(self, student_results, teacher_results, old_end):
         losses = {}
-        
-        # 1. 获取 Logits
         s_cls_score = student_results['cls_score']
         t_cls_score = teacher_results['cls_score']
-        
         if s_cls_score is None or t_cls_score is None:
             return losses
-
-        # 2. 截取旧类通道 (例如 0~18)
-        # 【关键】只拿出旧的前景类别，绝对不要包含背景通道！
-        # 如果包含背景，Teacher 会把新类物体当成背景，KL Loss 就会强迫 Student 也把它当背景。
-        s_logits_old = s_cls_score[:, :old_end]
+        
+        # 1. 拆解组件
         t_logits_old = t_cls_score[:, :old_end]
+        s_logits_new_bg = s_cls_score[:, old_end:].detach()
 
-        # 3. 生成 Mask: 只蒸馏 Teacher "看懂了" (置信度高) 的样本
+        # 2. 数值对齐
         with torch.no_grad():
-            # 这里可以用 softmax 或 sigmoid 看 Teacher 对旧类的信心
-            # 既然我们要用 KL (Softmax)，这里用 Softmax 比较一致
-            t_probs_all = F.softmax(t_cls_score, dim=1) 
+            t_mean = t_logits_old.mean(dim=1, keepdim=True)
+            t_std = t_logits_old.std(dim=1, keepdim=True)
+            s_mean = s_logits_new_bg.mean(dim=1, keepdim=True)
+            s_std = s_logits_new_bg.std(dim=1, keepdim=True)
             
-            # 拿到 Teacher 在旧类前景通道上的最大概率
-            # 注意：t_probs_all 包含了背景，我们看它是否觉得"是旧类前景"
-            t_max_prob, _ = t_probs_all[:, :old_end].max(dim=1)
-            
-            # 阈值筛选：只有 Teacher 确信这是旧类 (p > 0.4) 时，Student 才需要模仿
-            # 对于新类物体，Teacher 看到的旧类概率通常很低，会被过滤掉 -> 保护新类学习
-            valid_mask = t_max_prob > 0.5
+            # 将 Teacher 的分布拉伸到 Student 的水平
+            t_logits_old_aligned = (t_logits_old - t_mean) / (t_std + 1e-6) * s_std + s_mean
 
-        # 4. 计算 KL Divergence Loss
-        if valid_mask.sum() > 0:
-            # T = 3.0  # 温度系数，KL 蒸馏的标配，让分布更平滑，关注暗知识
-            
-            # 取出有效样本
-            s_valid = s_logits_old[valid_mask]
-            t_valid = t_logits_old[valid_mask]
+        # 3. 直接拼接
+        target_logits = torch.cat([t_logits_old_aligned, s_logits_new_bg], dim=1)
 
-            # Student 输出 Log Softmax
-            s_log_probs = F.log_softmax(s_valid, dim=1)
-            
-            # Teacher 输出 Softmax (作为 Target)
-            with torch.no_grad():
-                t_probs = F.softmax(t_valid, dim=1)
+        # 4. 计算全维度KL Loss
+        T = 1.0
+        loss_dist = F.kl_div(
+            F.log_softmax(s_cls_score / T, dim=1),
+            F.softmax(target_logits / T, dim=1),
+            reduction='batchmean'
+        )
 
-            # 计算 KL Loss
-            # reduction='batchmean' 是 KL 散度的标准用法，会自动除以 batch size
-            loss_dist_cls = F.kl_div(s_log_probs, t_probs, reduction='batchmean')
-            
-            # 权重建议：KL Loss 的梯度通常比 MSE 柔和，可以给适当的权重 (如 2.0 ~ 5.0)
-            losses['loss_roi_dist_cls'] = loss_dist_cls * 1.0
-        else:
-            losses['loss_roi_dist_cls'] = s_logits_old.sum() * 0.0
-
-        # 5. 回归蒸馏 (保持不变，同样只针对有效样本)
-        # s_bbox_pred = student_results['bbox_pred']
-        # t_bbox_pred = teacher_results['bbox_pred']
-
-        # if s_bbox_pred is not None and t_bbox_pred is not None:
-        #      if s_bbox_pred.shape == t_bbox_pred.shape:
-        #         if valid_mask.sum() > 0:
-        #             loss_dist_bbox = F.smooth_l1_loss(
-        #                 s_bbox_pred[valid_mask], 
-        #                 t_bbox_pred[valid_mask]
-        #             )
-        #             losses['loss_roi_dist_bbox'] = loss_dist_bbox * 2.0
-        #         else:
-        #             losses['loss_roi_dist_bbox'] = s_bbox_pred.sum() * 0.0
-            
+        losses['loss_roi_dist_cls'] = loss_dist * 2.0
         return losses
 
     def forward_train(self,

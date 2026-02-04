@@ -11,6 +11,8 @@ from mmcv import Config
 from mmcv.runner import load_checkpoint
 from mmdet.models import build_detector
 
+from .cat_seg_loss import SegOrthogonalLoss  # 直接导入类
+
 @DETECTORS.register_module()
 class CatSegDetector(TwoStageDetector):
     def __init__(self,
@@ -42,6 +44,8 @@ class CatSegDetector(TwoStageDetector):
         self.old_model = None
         if self.use_feature_routing and (old_cfg is not None) and (old_ckpt is not None):
             self.old_model = self._build_old_model(old_cfg, old_ckpt)
+
+        self.ortho_loss = SegOrthogonalLoss(loss_weight=0.5)
 
     def _build_old_model(self, cfg_path, ckpt_path):
         cfg = Config.fromfile(cfg_path)
@@ -135,8 +139,8 @@ class CatSegDetector(TwoStageDetector):
         teacher_cls_scores = teacher_outs[0]
         
         loss_dist = 0.0
-        # 蒸馏权重：建议设大一点 (5.0)，因为 RPN 是源头，且 BCE 数值通常较小
-        dist_weight = 1.0
+        dist_weight = 0.5
+        valid_layers = 0
 
         # 遍历 FPN 的每一层 (通常是 5 层)
         for s_cls, t_cls in zip(student_cls_scores, teacher_cls_scores):
@@ -149,7 +153,7 @@ class CatSegDetector(TwoStageDetector):
             # 2. 筛选掩码 (Masking)
             # 逻辑：只蒸馏 Teacher 认为是前景 (Object) 的区域 (> 0.1)
             # Teacher 认为是背景的区域，Student 可以自由预测 (可能是新类)
-            mask = t_prob > 0.1 
+            mask = t_prob > 0.5
             
             if mask.sum() > 0:
                 # 3. 计算 Soft BCE Loss
@@ -163,8 +167,12 @@ class CatSegDetector(TwoStageDetector):
                     reduction='mean'
                 )
                 loss_dist += loss_layer
+                valid_layers += 1
             else:
                 pass # 该层没有有效的旧类信号，跳过
+
+        if valid_layers > 0:
+            loss_dist = loss_dist / valid_layers
 
         return {'loss_rpn_dist': loss_dist * dist_weight}
 
@@ -206,6 +214,9 @@ class CatSegDetector(TwoStageDetector):
                 teacher_roi_head = self.old_model.roi_head
         
         losses = dict()
+
+        if cat_seg_logits is not None and cat_seg_logits.shape[1] > 1:
+            losses['loss_catseg_ortho'] = self.ortho_loss(cat_seg_logits)
 
         if self.with_rpn:
             proposal_cfg = self.train_cfg.get('rpn_proposal', self.test_cfg.rpn)

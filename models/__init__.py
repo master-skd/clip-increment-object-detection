@@ -11,3 +11,4 @@ from .cat_seg_rpn_head import CatSegRPNHead, CatSegPseudoLabelRPNHead  # noqa
 from .cat_seg_backbone import CATSegCLIPViT
 from .cat_seg_detector import CatSegDetector  # noqa
 from .simplefpn import SimpleFPN
+from .cat_seg_loss import SegOrthogonalLoss
