@@ -70,42 +70,6 @@ class CatSegDetector(TwoStageDetector):
             p.requires_grad_(False)
         return old_model
 
-    # def _filter_proposals_by_ignore(self, proposal_list, gt_bboxes_ignore,
-    #                                iou_thr=0.5, min_keep=512):
-    #     """过滤掉与 gt_bboxes_ignore IoU>=iou_thr 的 proposals.
-    #     proposal_list: list[Tensor], each (N,4) or (N,5)
-    #     gt_bboxes_ignore: list[Tensor], each (M,4)
-    #     """
-    #     new_list = []
-    #     for props, ign in zip(proposal_list, gt_bboxes_ignore):
-    #         if props is None or props.numel() == 0:
-    #             new_list.append(props)
-    #             continue
-    #         if ign is None or ign.numel() == 0:
-    #             new_list.append(props)
-    #             continue
-
-    #         # props 可能是 (N,4) 或 (N,5)，IoU 只用前4维
-    #         props_xyxy = props[:, :4].float()
-    #         ign_xyxy = ign[:, :4].float()
-
-    #         # bbox_overlaps 支持 CPU/CUDA，跟随输入 device
-    #         ious = bbox_overlaps(props_xyxy, ign_xyxy)  # [N, M]
-    #         max_iou = ious.max(dim=1)[0] if ious.numel() > 0 else props_xyxy.new_zeros((props_xyxy.size(0),))
-
-    #         keep = max_iou < iou_thr
-
-    #         # 安全：过滤太狠会导致 RCNN sampler 不够样本 -> 回退
-    #         if int(keep.sum().item()) < min_keep:
-    #             k = min(min_keep, props.size(0))
-    #             # 保留“与 ignore 重叠最小”的 k 个
-    #             _, idx = torch.topk(max_iou, k=k, largest=False)
-    #             new_list.append(props[idx])
-    #         else:
-    #             new_list.append(props[keep])
-
-    #     return new_list
-
     def simple_test(self, img, img_metas, proposals=None, rescale=False):
         assert self.with_bbox, 'Bbox head must be implemented.'
         res_feats = self.backbone(img)
@@ -132,49 +96,80 @@ class CatSegDetector(TwoStageDetector):
     
     def compute_rpn_distillation_loss(self, student_outs, teacher_outs):
         """
-        计算 RPN 蒸馏损失 (使用 Soft BCE)
-        student_outs: Tuple(cls_scores, bbox_preds)，每个元素是 List[Tensor] (对应 FPN 层级)
+        计算 RPN 级的蒸馏损失
+        student_outs: Tuple(cls_scores_list, bbox_preds_list)
+        teacher_outs: Tuple(cls_scores_list, bbox_preds_list)
         """
-        student_cls_scores = student_outs[0] 
-        teacher_cls_scores = teacher_outs[0]
+        s_cls_scores, s_bbox_preds = student_outs
+        t_cls_scores, t_bbox_preds = teacher_outs
         
-        loss_dist = 0.0
-        dist_weight = 0.5
-        valid_layers = 0
+        loss_rpn_cls = 0.0
+        loss_rpn_reg = 0.0
+        valid_levels = 0
+        
+        # 遍历 FPN 的每一层 (通常 5 层)
+        for s_cls, s_reg, t_cls, t_reg in zip(s_cls_scores, s_bbox_preds, t_cls_scores, t_bbox_preds):
+            # s_cls shape: [Batch, A, H, W] (A=num_anchors)
+            # s_reg shape: [Batch, A*4, H, W]
+            
+            # =================================================================
+            # Part 1: Objectness 蒸馏 (让 Student 敢于在旧类位置说"是")
+            # =================================================================
+            # RPN 的 GT 会把旧类标为背景 (0)。
+            # 必须用 MSE 让 Student 逼近 Teacher 的高分 (e.g. 0.9)，抵抗 GT 的 0。
+            t_probs = t_cls.sigmoid()
+            s_probs = s_cls.sigmoid()
+            
+            # 全图蒸馏 (MSE)，简单直接
+            loss_rpn_cls += F.mse_loss(s_probs, t_probs, reduction='mean')
 
-        # 遍历 FPN 的每一层 (通常是 5 层)
-        for s_cls, t_cls in zip(student_cls_scores, teacher_cls_scores):
-            # s_cls shape: [Batch, num_anchors, H, W]
+            # =================================================================
+            # Part 2: Regression 蒸馏 (解决你担心的"回归框问题")
+            # =================================================================
+            # 难点：RPN 输出的是 Offset。背景处的 Offset 是无意义的随机噪声。
+            # 策略：只在 Teacher 认为"是物体"的地方蒸馏回归。
             
-            # 1. 获取 Teacher 的软标签 (Sigmoid -> 概率)
-            with torch.no_grad():
-                t_prob = t_cls.sigmoid()
+            # 1. 生成前景掩码 (Mask)
+            # 阈值建议 0.7，只选 Teacher 很有把握的区域
+            fg_mask = t_probs > 0.7 
+            num_pos = fg_mask.sum()
             
-            # 2. 筛选掩码 (Masking)
-            # 逻辑：只蒸馏 Teacher 认为是前景 (Object) 的区域 (> 0.1)
-            # Teacher 认为是背景的区域，Student 可以自由预测 (可能是新类)
-            mask = t_prob > 0.5
-            
-            if mask.sum() > 0:
-                # 3. 计算 Soft BCE Loss
-                # binary_cross_entropy_with_logits 支持 target 为概率值
-                s_logits_masked = s_cls[mask]
-                t_probs_masked = t_prob[mask]
+            if num_pos > 0:
+                # 2. 维度对齐 (这是最容易出错的地方)
+                # s_reg 是 [B, A*4, H, W]，我们需要拆出 A 和 4
+                B, A4, H, W = s_reg.shape
+                A = A4 // 4
                 
-                loss_layer = F.binary_cross_entropy_with_logits(
-                    s_logits_masked, 
-                    t_probs_masked, 
-                    reduction='mean'
-                )
-                loss_dist += loss_layer
-                valid_layers += 1
-            else:
-                pass # 该层没有有效的旧类信号，跳过
+                # Reshape: [B, A*4, H, W] -> [B, A, 4, H, W]
+                # Permute: -> [B, A, H, W, 4] (把坐标维放到最后，方便用 mask 索引)
+                s_reg_perm = s_reg.view(B, A, 4, H, W).permute(0, 1, 3, 4, 2)
+                t_reg_perm = t_reg.view(B, A, 4, H, W).permute(0, 1, 3, 4, 2)
+                
+                # 3. 扩展 Mask
+                # fg_mask 是 [B, A, H, W]，需要变成 [B, A, H, W, 1] 才能广播到 4 个坐标
+                fg_mask_expanded = fg_mask.unsqueeze(-1).expand_as(s_reg_perm)
+                
+                # 4. 提取有效的前景回归值
+                s_pos_reg = s_reg_perm[fg_mask_expanded]
+                t_pos_reg = t_reg_perm[fg_mask_expanded]
+                
+                # 5. 计算 Smooth L1 Loss
+                # 相比 MSE，Smooth L1 对回归离群值更不敏感，防止梯度爆炸
+                loss_rpn_reg += F.smooth_l1_loss(s_pos_reg, t_pos_reg, reduction='mean')
+            
+            valid_levels += 1
 
-        if valid_layers > 0:
-            loss_dist = loss_dist / valid_layers
-
-        return {'loss_rpn_dist': loss_dist * dist_weight}
+        # 平均各层的 Loss
+        losses = {}
+        if valid_levels > 0:
+            # 权重建议：
+            # RPN 分类很重要，保持 Student 能够产生 Proposal
+            losses['loss_rpn_dist_cls'] = (loss_rpn_cls / valid_levels) * 1.0
+            
+            # RPN 回归是辅助，确保框比较准。权重可以给 1.0 或 0.5
+            losses['loss_rpn_dist_reg'] = (loss_rpn_reg / valid_levels) * 1.0
+            
+        return losses
 
     def forward_train(self,
                       img,

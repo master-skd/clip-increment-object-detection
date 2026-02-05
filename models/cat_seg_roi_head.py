@@ -383,102 +383,76 @@ class CatSegMaskRoIHead(StandardRoIHead):
 
         return tuple(weighted_feats)
 
-    # def compute_roi_distillation_loss(self, student_results, teacher_results, old_end):
-    #     losses = {}
-        
-    #     # 1. 获取 Logits
-    #     s_cls_score = student_results['cls_score']
-    #     t_cls_score = teacher_results['cls_score']
-        
-    #     if s_cls_score is None or t_cls_score is None:
-    #         return losses
-
-    #     # 2. 截取旧类通道 (例如 0~18)
-    #     # 【关键】只拿出旧的前景类别，绝对不要包含背景通道！
-    #     # 如果包含背景，Teacher 会把新类物体当成背景，KL Loss 就会强迫 Student 也把它当背景。
-    #     s_logits_old = s_cls_score[:, :old_end]
-    #     t_logits_old = t_cls_score[:, :old_end]
-
-    #     # 3. 生成 Mask: 只蒸馏 Teacher "看懂了" (置信度高) 的样本
-    #     with torch.no_grad():
-    #         # 这里可以用 softmax 或 sigmoid 看 Teacher 对旧类的信心
-    #         # 既然我们要用 KL (Softmax)，这里用 Softmax 比较一致
-    #         t_probs_all = F.softmax(t_cls_score, dim=1) 
-            
-    #         # 拿到 Teacher 在旧类前景通道上的最大概率
-    #         # 注意：t_probs_all 包含了背景，我们看它是否觉得"是旧类前景"
-    #         t_max_prob, _ = t_probs_all[:, :old_end].max(dim=1)
-            
-    #         # 阈值筛选：只有 Teacher 确信这是旧类 (p > 0.4) 时，Student 才需要模仿
-    #         # 对于新类物体，Teacher 看到的旧类概率通常很低，会被过滤掉 -> 保护新类学习
-    #         valid_mask = t_max_prob > 0.5
-
-    #     # 4. 计算 KL Divergence Loss
-    #     if valid_mask.sum() > 0:
-    #         # T = 3.0  # 温度系数，KL 蒸馏的标配，让分布更平滑，关注暗知识
-            
-    #         # 取出有效样本
-    #         s_valid = s_logits_old[valid_mask]
-    #         t_valid = t_logits_old[valid_mask]
-
-    #         # Student 输出 Log Softmax
-    #         s_log_probs = F.log_softmax(s_valid, dim=1)
-            
-    #         # Teacher 输出 Softmax (作为 Target)
-    #         with torch.no_grad():
-    #             t_probs = F.softmax(t_valid, dim=1)
-
-    #         # 计算 KL Loss
-    #         # reduction='batchmean' 是 KL 散度的标准用法，会自动除以 batch size
-    #         loss_dist_cls = F.kl_div(s_log_probs, t_probs, reduction='batchmean')
-            
-    #         # 权重建议：KL Loss 的梯度通常比 MSE 柔和，可以给适当的权重 (如 2.0 ~ 5.0)
-    #         losses['loss_roi_dist_cls'] = loss_dist_cls * 1.0
-    #     else:
-    #         losses['loss_roi_dist_cls'] = s_logits_old.sum() * 0.0
-
-    #     # 5. 回归蒸馏 (保持不变，同样只针对有效样本)
-    #     # s_bbox_pred = student_results['bbox_pred']
-    #     # t_bbox_pred = teacher_results['bbox_pred']
-
-    #     # if s_bbox_pred is not None and t_bbox_pred is not None:
-    #     #      if s_bbox_pred.shape == t_bbox_pred.shape:
-    #     #         if valid_mask.sum() > 0:
-    #     #             loss_dist_bbox = F.smooth_l1_loss(
-    #     #                 s_bbox_pred[valid_mask], 
-    #     #                 t_bbox_pred[valid_mask]
-    #     #             )
-    #     #             losses['loss_roi_dist_bbox'] = loss_dist_bbox * 2.0
-    #     #         else:
-    #     #             losses['loss_roi_dist_bbox'] = s_bbox_pred.sum() * 0.0
-            
-    #     return losses
-
     def compute_roi_distillation_loss(self, student_results, teacher_results, old_end):
         losses = {}
         s_cls_score = student_results['cls_score']
         t_cls_score = teacher_results['cls_score']
+        
         if s_cls_score is None or t_cls_score is None:
             return losses
         
+        # =====================================================================
         # 1. 拆解组件
+        # =====================================================================
         t_logits_old = t_cls_score[:, :old_end]
-        s_logits_new_bg = s_cls_score[:, old_end:].detach()
+        t_logits_bg = t_cls_score[:, -1:] # 单独取出 Teacher 背景
+        
+        # 我们把新类和背景拆开，因为我们要修改背景，但保留新类
+        s_logits_new = s_cls_score[:, old_end:-1].detach()
+        s_logits_bg = s_cls_score[:, -1:].detach()
 
-        # 2. 数值对齐
+        # =====================================================================
+        # 2. 数值对齐 (Alignment)
+        # =====================================================================
         with torch.no_grad():
-            t_mean = t_logits_old.mean(dim=1, keepdim=True)
-            t_std = t_logits_old.std(dim=1, keepdim=True)
-            s_mean = s_logits_new_bg.mean(dim=1, keepdim=True)
-            s_std = s_logits_new_bg.std(dim=1, keepdim=True)
+            # 计算 Student 的统计量 (参考你原来的逻辑，用新类+背景的统计量)
+            s_part_for_stats = torch.cat([s_logits_new, s_logits_bg], dim=1)
+            s_mean = s_part_for_stats.mean(dim=1, keepdim=True)
+            s_std = s_part_for_stats.std(dim=1, keepdim=True)
             
-            # 将 Teacher 的分布拉伸到 Student 的水平
-            t_logits_old_aligned = (t_logits_old - t_mean) / (t_std + 1e-6) * s_std + s_mean
+            # 计算 Teacher 的统计量 (用旧类+背景的统计量，更全面)
+            t_part_for_stats = t_cls_score # 或者 t_logits_old
+            t_mean = t_part_for_stats.mean(dim=1, keepdim=True)
+            t_std = t_part_for_stats.std(dim=1, keepdim=True)
+            
+            # 定义对齐函数：把 T 映射到 S 的尺度
+            def align(x):
+                return (x - t_mean) / (t_std + 1e-6) * s_std + s_mean
 
-        # 3. 直接拼接
-        target_logits = torch.cat([t_logits_old_aligned, s_logits_new_bg], dim=1)
+            # 对齐 Teacher 的旧类部分
+            t_logits_old_aligned = align(t_logits_old)
+            
+            # 【关键】同时也对齐 Teacher 的背景部分
+            # 因为我们要把这个值填进 Target，它必须和 Student 的尺度一致
+            t_logits_bg_aligned = align(t_logits_bg)
 
-        # 4. 计算全维度KL Loss
+        # =====================================================================
+        # 3. 动态背景选择 (Selective Background) - 你的 Idea
+        # =====================================================================
+        with torch.no_grad():
+            # 判断 Teacher 认为这是不是旧物体
+            # 比较 Teacher 原始 Logits: 最高旧类分 vs 背景分
+            t_max_old, _ = t_logits_old.max(dim=1, keepdim=True)
+            is_teacher_fg = t_max_old > t_logits_bg
+            
+            # 构造 Target 的背景部分：
+            # 如果是旧物体 -> 用 Teacher 的低背景分 (压制 Student)
+            # 如果是新物体/背景 -> 用 Student 自己的背景分 (保持现状)
+            target_bg_logit = torch.where(is_teacher_fg, t_logits_bg_aligned, s_logits_bg)
+
+        # =====================================================================
+        # 4. 拼接生成 Target
+        # =====================================================================
+        # Target = [Teacher旧类, Student新类, 修正后的背景]
+        target_logits = torch.cat([
+            t_logits_old_aligned, 
+            s_logits_new, 
+            target_bg_logit
+        ], dim=1)
+
+        # =====================================================================
+        # 5. 计算 KL Loss
+        # =====================================================================
         T = 1.0
         loss_dist = F.kl_div(
             F.log_softmax(s_cls_score / T, dim=1),
@@ -486,7 +460,65 @@ class CatSegMaskRoIHead(StandardRoIHead):
             reduction='batchmean'
         )
 
-        losses['loss_roi_dist_cls'] = loss_dist * 2.0
+        losses['loss_roi_dist_cls'] = loss_dist * 2.0 # 建议权重稍微大一点，因为 KL 比较软
+
+        s_bbox_pred = student_results['bbox_pred']
+        t_bbox_pred = teacher_results['bbox_pred']
+        t_cls_score = teacher_results['cls_score']
+
+        if s_bbox_pred is not None and t_bbox_pred is not None:
+            # 1. 确定哪些样本需要蒸馏
+            # 逻辑：只蒸馏 Teacher 确信是 "旧类" 的样本
+            with torch.no_grad():
+                t_probs = F.softmax(t_cls_score, dim=1)
+                
+                # 只看旧类通道 (0 ~ old_end)
+                # 获取每个样本在旧类中的最大概率和对应的类别索引
+                t_max_prob, t_label = t_probs[:, :old_end].max(dim=1)
+                
+                # 筛选条件：概率 > 0.6 且属于旧类范围
+                # (t_label < old_end 其实是废话，因为我们切片了，但逻辑上是这样)
+                valid_mask = t_max_prob > 0.6
+            
+            # 如果有有效的样本，才计算 Loss
+            if valid_mask.sum() > 0:
+                
+                # 2. 处理 Class-Specific 回归维度 [N, C*4]
+                # 检查是否是共享回归 (shape[1] == 4) 还是分列回归 (shape[1] > 4)
+                if s_bbox_pred.shape[1] > 4:
+                    # 获取 Teacher 预测的类别对应的 4 个坐标
+                    # t_label 是 [N]，需要扩展成索引取值
+                    
+                    # 重新 reshape: [N, C*4] -> [N, C, 4]
+                    N = s_bbox_pred.shape[0]
+                    s_bbox_reshaped = s_bbox_pred.view(N, -1, 4)
+                    t_bbox_reshaped = t_bbox_pred.view(N, -1, 4)
+                    
+                    # 只取出 valid_mask 为 True 的行
+                    s_valid = s_bbox_reshaped[valid_mask]
+                    t_valid = t_bbox_reshaped[valid_mask]
+                    labels_valid = t_label[valid_mask]
+                    
+                    # 从 [M, C, 4] 中取出 [M, 4]，利用 gather 或索引
+                    # 这里用 range 索引比较直观
+                    indices = torch.arange(len(labels_valid), device=s_bbox_pred.device)
+                    
+                    s_target_box = s_valid[indices, labels_valid]
+                    t_target_box = t_valid[indices, labels_valid]
+                    
+                else:
+                    # Class Agnostic (只有4个值)，直接取
+                    s_target_box = s_bbox_pred[valid_mask]
+                    t_target_box = t_bbox_pred[valid_mask]
+
+                # 3. 计算 Smooth L1 Loss
+                # 为什么不用 MSE？回归值可能有离群点，MSE 平方后梯度太大，容易重现之前的爆炸
+                loss_dist_bbox = F.smooth_l1_loss(s_target_box, t_target_box, reduction='mean')
+                
+                # 4. 权重配置
+                # 建议 1.0 或 2.0，不需要像 CLS 那么大
+                losses['loss_roi_dist_bbox'] = loss_dist_bbox * 2.0
+
         return losses
 
     def forward_train(self,
@@ -631,32 +663,32 @@ class CatSegMaskRoIHead(StandardRoIHead):
 
         return losses
     
-    def _inject_gt_to_topk(self, topk_indices, gt_labels, k_old=3):
-        if topk_indices is None:
-            return None
-        topk = topk_indices.clone()
-        B, K = topk.shape
-        device = topk.device
+    # def _inject_gt_to_topk(self, topk_indices, gt_labels, k_old=3):
+    #     if topk_indices is None:
+    #         return None
+    #     topk = topk_indices.clone()
+    #     B, K = topk.shape
+    #     device = topk.device
 
-        for i in range(B):
-            gt = torch.unique(gt_labels[i]).to(device=device, dtype=torch.long)
-            # 去掉非法
-            gt = gt[gt >= 0]
-            # 逐个注入缺失的 gt
-            for g in gt.tolist():
-                if (topk[i] == g).any():
-                    continue
-                # 优先替换 new 槽位（从尾到 k_old）
-                replaced = False
-                for pos in range(K - 1, k_old - 1, -1):
-                    if topk[i, pos].item() not in gt.tolist():
-                        topk[i, pos] = g
-                        replaced = True
-                        break
-                if not replaced:
-                    # 实在塞不进就跳过（一般不会发生）
-                    pass
-        return topk
+    #     for i in range(B):
+    #         gt = torch.unique(gt_labels[i]).to(device=device, dtype=torch.long)
+    #         # 去掉非法
+    #         gt = gt[gt >= 0]
+    #         # 逐个注入缺失的 gt
+    #         for g in gt.tolist():
+    #             if (topk[i] == g).any():
+    #                 continue
+    #             # 优先替换 new 槽位（从尾到 k_old）
+    #             replaced = False
+    #             for pos in range(K - 1, k_old - 1, -1):
+    #                 if topk[i, pos].item() not in gt.tolist():
+    #                     topk[i, pos] = g
+    #                     replaced = True
+    #                     break
+    #             if not replaced:
+    #                 # 实在塞不进就跳过（一般不会发生）
+    #                 pass
+    #     return topk
 
 
     def _bbox_forward(self, x, rois, cat_seg_feats, topk_indices=None, x_old=None, old_end=19, vlm_feat=None):
@@ -820,95 +852,6 @@ class CatSegMaskBBoxHead(ConvFCBBoxHead):
 
         if learn_bg:
             self.bg_embedding = nn.Parameter(all_embed[:, -1:].clone().contiguous())
-        
-        # self.old_end = old_end
-        # self.is_incremental = is_incremental
-        # self.teacher_branch = None
-        # if self.is_incremental:
-        #     # 此时 student 的权重可能还是随机的，没关系，我们先复制结构
-        #     # 这样 MMCV 就能监测到这些参数的存在，不会报错
-        #     self.teacher_branch = nn.ModuleDict({
-        #         'shared_convs': copy.deepcopy(self.shared_convs),
-        #         'shared_fcs': copy.deepcopy(self.shared_fcs),
-        #         'cls_convs': copy.deepcopy(self.cls_convs),
-        #         'cls_fcs': copy.deepcopy(self.cls_fcs)
-        #     })
-            
-        #     # 顺便直接把 Teacher 冻结住
-        #     self.teacher_branch.eval()
-        #     for param in self.teacher_branch.parameters():
-        #         param.requires_grad = False
-
-    # def init_weights(self):
-    #     super().init_weights()
-
-    #     # =======================================================
-    #     # 修改点 2: 这里只做权重数值的同步 (State Dict Copy)
-    #     # =======================================================
-    #     if self.is_incremental and self.teacher_branch is not None:
-    #         print(f"==> [CatSegHead] Incremental Mode: Syncing Teacher weights from initialized Student...")
-            
-    #         # 使用 load_state_dict 把 Student 的权重值覆盖到 Teacher 上
-    #         self.teacher_branch['shared_convs'].load_state_dict(self.shared_convs.state_dict())
-    #         self.teacher_branch['shared_fcs'].load_state_dict(self.shared_fcs.state_dict())
-    #         self.teacher_branch['cls_convs'].load_state_dict(self.cls_convs.state_dict())
-    #         self.teacher_branch['cls_fcs'].load_state_dict(self.cls_fcs.state_dict())
-            
-    #         print(f"==> [CatSegHead] Teacher weights synced and frozen.")
-    #     else:
-    #         print(f"==> [CatSegHead] Base Mode: No Teacher used.")
-
-    # def get_channel_mask(self, x, topk_indices):
-    #     """生成旧类通道掩码 (仅在 Incremental 模式下使用)"""
-    #     N, KC, H, W = x.shape
-    #     K = topk_indices.shape[1]
-    #     C = KC // K
-    #     is_old = topk_indices < self.old_end
-    #     mask_old = is_old.unsqueeze(-1).expand(-1, -1, C).reshape(N, -1)
-    #     mask_old = mask_old.view(N, KC, 1, 1).type_as(x)
-    #     return mask_old
-    
-    # def forward_teacher(self, x):
-    #     """
-    #     Teacher 前向传播
-    #     修改：必须同时返回 cls_score 和 bbox_pred
-    #     """
-    #     # 1. Shared Parts
-    #     if self.num_shared_convs > 0:
-    #         for conv in self.teacher_branch['shared_convs']:
-    #             x = conv(x)
-    #     if self.num_shared_fcs > 0:
-    #         if self.with_avg_pool:
-    #             x = self.avg_pool(x)
-    #         x = x.flatten(1)
-    #         for fc in self.teacher_branch['shared_fcs']:
-    #             x = self.relu(fc(x))
-        
-    #     # 2. Cls Branch
-    #     x_cls = x
-    #     for conv in self.teacher_branch['cls_convs']:
-    #         x_cls = conv(x_cls)
-    #     if x_cls.dim() > 2:
-    #         x_cls = x_cls.flatten(1)
-    #     for fc in self.teacher_branch['cls_fcs']:
-    #         x_cls = self.relu(fc(x_cls))
-            
-    #     # 3. Reg Branch (新增)
-    #     x_reg = x
-    #     # 假设 teacher 结构和 student 一样，也有 reg_convs/fcs
-    #     # 如果你的 teacher_branch 构建时没 copy reg部分，需要去 init 里加上
-    #     if 'reg_convs' in self.teacher_branch:
-    #          for conv in self.teacher_branch['reg_convs']:
-    #             x_reg = conv(x_reg)
-    #     if x_reg.dim() > 2:
-    #         if self.with_avg_pool:
-    #             x_reg = self.avg_pool(x_reg)
-    #         x_reg = x_reg.flatten(1)
-    #     if 'reg_fcs' in self.teacher_branch:
-    #         for fc in self.teacher_branch['reg_fcs']:
-    #             x_reg = self.relu(fc(x_reg))
-
-    #     return x_cls, x_reg
 
     @property
     def all_embed(self):
@@ -972,29 +915,6 @@ class CatSegMaskBBoxHead(ConvFCBBoxHead):
         
         bbox_pred = self.fc_reg(x_reg) if self.with_reg else None
 
-        # if self.is_incremental and self.training and self.teacher_branch is not None:
-        #     with torch.no_grad():
-        #         # 获取 Teacher 的 Cls 和 Reg 特征
-        #         x_out_teacher_cls, x_out_teacher_reg = self.forward_teacher(x)
-                
-        #         # 计算 Teacher Logits
-        #         norm_teacher = F.normalize(x_out_teacher_cls, p=2, dim=-1, eps=1e-6)
-        #         scores_teacher = (norm_teacher @ all_embed) * self.logit_scale
-                
-        #         # 计算 Teacher BBoxes
-        #         bboxes_teacher = self.fc_reg(x_out_teacher_reg) if self.with_reg else None
-            
-        #     # 缓存起来，loss 里用
-        #     self.latest_teacher_scores = scores_teacher
-        #     self.latest_teacher_bboxes = bboxes_teacher
-        # else:
-        #     self.latest_teacher_scores = None
-        #     self.latest_teacher_bboxes = None
-
-        # 只在topk空间里学习
-        # if self.training:
-        #     cls_score = self._mask_logits_by_topk(cls_score, rois, topk_indices)
-
         if not self.training and normalized_vlm_box_feats is not None:
             cls_score = cls_score.softmax(dim=-1)
             vlm_score = (normalized_vlm_box_feats @ all_embed) * self.vlm_temperature
@@ -1006,229 +926,6 @@ class CatSegMaskBBoxHead(ConvFCBBoxHead):
                     1 - self.beta) * vlm_score[:, self.novel_idx] ** self.beta
 
         return cls_score, bbox_pred
-    
-    # def loss(self,
-    #          cls_score,
-    #          bbox_pred,
-    #          rois,
-    #          labels,
-    #          label_weights,
-    #          bbox_targets,
-    #          bbox_weights,
-    #          reduction_override=None):
-    #     # ---------------------------------------------------
-    #     # 1. 常规 Loss (基于 Merged GT)
-    #     # ---------------------------------------------------
-    #     # 重要：因为您已经把伪标签加入了 GT，这里会正常计算旧类的 CrossEntropy Loss。
-    #     # 请确保 config 里的 loss_cls 没有屏蔽旧类！
-    #     losses = super().loss(cls_score,
-    #          bbox_pred,
-    #          rois,
-    #          labels,
-    #          label_weights,
-    #          bbox_targets,
-    #          bbox_weights,
-    #          reduction_override=None)
-
-    #     # ---------------------------------------------------
-    #     # 2. 蒸馏 Loss (辅助旧类)
-    #     # ---------------------------------------------------
-    #     if self.is_incremental and self.training and self.latest_teacher_scores is not None:
-            
-    #         # --- A. 筛选 Mask ---
-    #         with torch.no_grad():
-    #             t_probs = F.softmax(self.latest_teacher_scores, dim=1)
-    #             novel_prob_sum = t_probs[:, self.novel_idx].sum(dim=1)
-    #             # 筛选 Teacher 确信是旧类的样本
-    #             valid_mask = novel_prob_sum > 0.3 
-
-    #         if valid_mask.sum() > 0:
-    #             # --- B. 分类蒸馏 (KL) ---
-    #             T = 3.0
-    #             s_logits_old = cls_score[valid_mask][:, self.novel_idx]
-    #             t_logits_old = self.latest_teacher_scores[valid_mask][:, self.novel_idx]
-                
-    #             losses['loss_dist_cls'] = F.kl_div(
-    #                 F.log_softmax(s_logits_old / T, dim=1),
-    #                 F.softmax(t_logits_old / T, dim=1),
-    #                 reduction='batchmean'
-    #             ) * (T**2) * 2.0
-
-    #             # --- C. 回归蒸馏 (Smooth L1) - [修复点] ---
-    #             if bbox_pred is not None and self.latest_teacher_bboxes is not None:
-                    
-    #                 # 判断是 Class Agnostic (N, 4) 还是 Class Specific (N, 4*C)
-    #                 if bbox_pred.shape[1] == 4:
-    #                     # === 情况 1: 类别无关回归 (Class Agnostic) ===
-    #                     # 此时不分新旧类通道，所有类别共用一组回归参数
-    #                     # 我们直接蒸馏有效样本的回归值即可
-                        
-    #                     s_bbox_target = bbox_pred[valid_mask]
-    #                     t_bbox_target = self.latest_teacher_bboxes[valid_mask]
-                        
-    #                     losses['loss_dist_bbox'] = F.smooth_l1_loss(
-    #                         s_bbox_target, 
-    #                         t_bbox_target, 
-    #                         reduction='mean'
-    #                     ) * 1.0
-                        
-    #                 else:
-    #                     # === 情况 2: 类别特定回归 (Class Specific) ===
-    #                     # 此时 shape 是 [N, 4 * num_classes]
-    #                     # 需要 reshape 并只切出旧类通道
-                        
-    #                     num_bbox_classes = bbox_pred.shape[1] // 4
-    #                     s_bbox = bbox_pred.reshape(-1, num_bbox_classes, 4)
-    #                     t_bbox = self.latest_teacher_bboxes.reshape(-1, num_bbox_classes, 4)
-                        
-    #                     # 取 Valid 样本 + Novel 通道
-    #                     s_bbox_target = s_bbox[valid_mask][:, self.novel_idx, :]
-    #                     t_bbox_target = t_bbox[valid_mask][:, self.novel_idx, :]
-                        
-    #                     losses['loss_dist_bbox'] = F.smooth_l1_loss(
-    #                         s_bbox_target, 
-    #                         t_bbox_target, 
-    #                         reduction='mean'
-    #                     ) * 1.0
-
-    #             # 清理缓存
-    #             self.latest_teacher_scores = None
-    #             self.latest_teacher_bboxes = None
-
-    #     return losses
-
-    # def forward(self, x, vlm_box_feats=None, rois=None, topk_indices=None):
-    #     # x: [N, KC, 7, 7]
-    #     all_embed = self.all_embed.type_as(x)
-
-    #     if vlm_box_feats is not None:
-    #         assert not self.training
-    #         normalized_vlm_box_feats = F.normalize(vlm_box_feats, dim=-1, p=2)
-    #     else:
-    #         normalized_vlm_box_feats = None
-
-    #     use_teacher_branck = self.is_incremental and self.training and (self.teacher_branch is not None)
-    #     # =======================================================
-    #     # 场景 A: Task 1 (Base Training) - 纯 Student 跑法
-    #     # =======================================================
-    #     if not use_teacher_branck:
-    #         # 正常的 ConvFCHead 流程
-    #         # ... (复用父类逻辑或手动写一遍) ...
-    #         feat = x
-    #         if self.num_shared_convs > 0:
-    #             for conv in self.shared_convs:
-    #                 feat = conv(feat)
-    #         if self.num_shared_fcs > 0:
-    #             if self.with_avg_pool:
-    #                 feat = self.avg_pool(feat)
-    #             feat = feat.flatten(1)
-    #             for fc in self.shared_fcs:
-    #                 feat = self.relu(fc(feat))
-            
-    #         # Cls Branch
-    #         x_cls = feat
-    #         for conv in self.cls_convs:
-    #             x_cls = conv(x_cls)
-    #         if x_cls.dim() > 2:
-    #             x_cls = x_cls.flatten(1)
-    #         for fc in self.cls_fcs:
-    #             x_cls = self.relu(fc(x_cls))
-            
-    #         norm_cls = F.normalize(x_cls, p=2, dim=-1, eps=1e-6)
-    #         cls_score = (norm_cls @ all_embed) * self.logit_scale
-            
-    #         # Reg Branch
-    #         x_reg = feat
-    #         # ... (Reg logic) ...
-    #         for conv in self.reg_convs:
-    #             x_reg = conv(x_reg)
-    #         if x_reg.dim() > 2:
-    #             if self.with_avg_pool:
-    #                 x_reg = self.avg_pool(x_reg)
-    #             x_reg = x_reg.flatten(1)
-    #         for fc in self.reg_fcs:
-    #             x_reg = self.relu(fc(x_reg))
-    #         bbox_pred = self.fc_reg(x_reg) if self.with_reg else None
-            
-    #         return cls_score, bbox_pred
-
-    #     # =======================================================
-    #     # 场景 B: Task 2+ (Incremental) - 双流 + 通道掩码
-    #     # =======================================================
-        
-    #     # 1. 准备掩码
-    #     if topk_indices is not None and rois is not None:
-    #         batch_inds = rois[:, 0].long()
-    #         # 兼容 indices 和 x 的 batch 对齐
-    #         current_indices = topk_indices[batch_inds] if topk_indices.shape[0] != x.shape[0] else topk_indices
-    #         mask_old = self.get_channel_mask(x, current_indices)
-    #         mask_new = 1.0 - mask_old
-    #     else:
-    #         # 兜底：如果没有 index，默认全开
-    #         mask_old = torch.ones_like(x)
-    #         mask_new = torch.ones_like(x)
-
-    #     # 2. Teacher Forward (Old Channels Only)
-    #     x_teacher_in = x * mask_old
-    #     with torch.no_grad():
-    #         x_out_teacher = self.forward_teacher(x_teacher_in)
-    #         norm_teacher = F.normalize(x_out_teacher, p=2, dim=-1, eps=1e-6)
-    #         scores_teacher = (norm_teacher @ all_embed) * self.logit_scale
-
-    #     # 3. Student Forward (Gradient Detach on Old Channels)
-    #     x_student_in = (x * mask_old).detach() + (x * mask_new)
-        
-    #     feat = x_student_in
-    #     # ... Shared Layers ...
-    #     if self.num_shared_convs > 0:
-    #         for conv in self.shared_convs:
-    #             feat = conv(feat)
-    #     if self.num_shared_fcs > 0:
-    #         if self.with_avg_pool:
-    #             feat = self.avg_pool(feat)
-    #         feat = feat.flatten(1)
-    #         for fc in self.shared_fcs:
-    #             feat = self.relu(fc(feat))
-        
-    #     # ... Cls Branch ...
-    #     x_cls = feat
-    #     for conv in self.cls_convs:
-    #         x_cls = conv(x_cls)
-    #     if x_cls.dim() > 2:
-    #         x_cls = x_cls.flatten(1)
-    #     for fc in self.cls_fcs:
-    #         x_cls = self.relu(fc(x_cls))
-        
-    #     norm_student = F.normalize(x_cls, p=2, dim=-1, eps=1e-6)
-    #     scores_student = (norm_student @ all_embed) * self.logit_scale
-
-    #     # 4. Stitching
-    #     cls_score = scores_student.clone()
-    #     cls_score[:, self.novel_idx] = scores_teacher[:, self.novel_idx]
-
-    #     # 5. Reg Branch (Student Only)
-    #     x_reg = feat
-    #     for conv in self.reg_convs:
-    #         x_reg = conv(x_reg)
-    #     if x_reg.dim() > 2:
-    #         if self.with_avg_pool:
-    #             x_reg = self.avg_pool(x_reg)
-    #         x_reg = x_reg.flatten(1)
-    #     for fc in self.reg_fcs:
-    #         x_reg = self.relu(fc(x_reg))
-    #     bbox_pred = self.fc_reg(x_reg) if self.with_reg else None
-
-    #     if not self.training and normalized_vlm_box_feats is not None:
-    #         cls_score = cls_score.softmax(dim=-1)
-    #         vlm_score = (normalized_vlm_box_feats @ all_embed) * self.vlm_temperature
-    #         vlm_score = vlm_score.softmax(dim=-1)
-
-    #         cls_score[:, self.base_idx] = cls_score[:, self.base_idx] ** (
-    #             1 - self.alpha) * vlm_score[:, self.base_idx] ** self.alpha
-    #         cls_score[:, self.novel_idx] = cls_score[:, self.novel_idx] ** (
-    #                 1 - self.beta) * vlm_score[:, self.novel_idx] ** self.beta
-
-    #     return cls_score, bbox_pred
 
     @force_fp32(apply_to=('cls_score', 'bbox_pred'))
     def get_bboxes(self,

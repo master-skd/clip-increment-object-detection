@@ -283,9 +283,9 @@ data = dict(
     workers_per_gpu=8,
     train=dict(
         type=dataset_type,
-        # ann_file=
-        # '/mnt/data14/yyg/datasets/Incremental/train_task_2.json',
-        ann_file='/mnt/data14/yyg/F-ViT/train_task2_with_pseudo_labels_2d.json',
+        ann_file=
+        '/mnt/data14/yyg/datasets/Incremental/train_task_2.json',
+        # ann_file='/mnt/data14/yyg/F-ViT/train_task2_with_pseudo_labels_2d.json',
         img_prefix='/mnt/data14/yyg/datasets/MSCOCO/2017/train2017',
         seen_classes='datasets/incremental_classes/task2_classes.json',
         all_classes='datasets/incremental_classes/task12_classes.json',
@@ -321,8 +321,8 @@ lr_config = dict(
 
     warmup='linear',
     # warmup_iters=10482,  # 2张卡
-    # warmup_iters=3498,  # 6张卡
-    warmup_iters=5244,
+    warmup_iters=3498,  # 6张卡
+    # warmup_iters=5244,
     warmup_ratio=0.001,
     )
 runner = dict(type='EpochBasedRunner', max_epochs=30)
