@@ -364,19 +364,19 @@ class CatSegMaskRoIHead(StandardRoIHead):
             base_new = lvl_new.unsqueeze(1) # [B, 1, C, H, W]
 
             # 只有在提供了 Teacher FPN 且 提供了索引时，才启用替换
-            if (x_fpn_old is not None) and (topk_indices is not None):
-                lvl_old = x_fpn_old[lvl]
-                base_old = lvl_old.unsqueeze(1)
+            # if (x_fpn_old is not None) and (topk_indices is not None):
+            #     lvl_old = x_fpn_old[lvl]
+            #     base_old = lvl_old.unsqueeze(1)
 
-                # 判定旧类 (Novel/Task1): indices < old_end
-                old_mask = (topk_indices < old_end).view(B, -1, 1, 1, 1)
+            #     # 判定旧类 (Novel/Task1): indices < old_end
+            #     old_mask = (topk_indices < old_end).view(B, -1, 1, 1, 1)
                 
-                # === 核心逻辑 ===
-                # 旧类(Novel)强制用 Teacher -> 保证 AP 回到 20+
-                # 新类(Base)用 Student -> 保证学习新知识
-                base = torch.where(old_mask, base_old, base_new)
-            else:
-                base = base_new.expand(B, x_mask.size(1), C, H, W)
+            #     # === 核心逻辑 ===
+            #     # 旧类(Novel)强制用 Teacher -> 保证 AP 回到 20+
+            #     # 新类(Base)用 Student -> 保证学习新知识
+            #     base = torch.where(old_mask, base_old, base_new)
+            # else:
+            base = base_new.expand(B, x_mask.size(1), C, H, W)
 
             weighted = base * mask_sig.unsqueeze(2)
             weighted_feats.append(rearrange(weighted, 'B K C H W -> B (K C) H W'))
@@ -384,140 +384,149 @@ class CatSegMaskRoIHead(StandardRoIHead):
         return tuple(weighted_feats)
 
     def compute_roi_distillation_loss(self, student_results, teacher_results, old_end):
+        """
+        计算 R-CNN 阶段的 ERD 蒸馏损失 (支持 Softmax 分类头)
+        
+        Args:
+            student_results (dict): Student 的 RoI 预测结果，包含 'cls_score' 和 'bbox_pred'
+            teacher_results (dict): Teacher 的 RoI 预测结果
+            old_end (int): 旧类别数量 (不含背景)。例如 Task1 有 40 类，则 old_end=40。
+                            假设 Student 的通道排列为 [0~39 (旧), 40~79 (新), 80 (背景)]
+                            假设 Teacher 的通道排列为 [0~39 (旧), 40 (背景)]
+        """
         losses = {}
         s_cls_score = student_results['cls_score']
         t_cls_score = teacher_results['cls_score']
         
+        # 基础检查
         if s_cls_score is None or t_cls_score is None:
             return losses
-        
-        # =====================================================================
-        # 1. 拆解组件
-        # =====================================================================
-        t_logits_old = t_cls_score[:, :old_end]
-        t_logits_bg = t_cls_score[:, -1:] # 单独取出 Teacher 背景
-        
-        # 我们把新类和背景拆开，因为我们要修改背景，但保留新类
-        s_logits_new = s_cls_score[:, old_end:-1].detach()
-        s_logits_bg = s_cls_score[:, -1:].detach()
 
-        # =====================================================================
-        # 2. 数值对齐 (Alignment)
-        # =====================================================================
+        # -------------------------------------------------
+        # 1. 计算 Teacher 的统计量与弹性权重 (ERD Core)
+        # -------------------------------------------------
         with torch.no_grad():
-            # 计算 Student 的统计量 (参考你原来的逻辑，用新类+背景的统计量)
-            s_part_for_stats = torch.cat([s_logits_new, s_logits_bg], dim=1)
-            s_mean = s_part_for_stats.mean(dim=1, keepdim=True)
-            s_std = s_part_for_stats.std(dim=1, keepdim=True)
+            T = 1.0 # 蒸馏温度
+            # Teacher 的 Softmax 概率
+            t_probs = F.softmax(t_cls_score / T, dim=1) # [N, old_end + 1]
             
-            # 计算 Teacher 的统计量 (用旧类+背景的统计量，更全面)
-            t_part_for_stats = t_cls_score # 或者 t_logits_old
-            t_mean = t_part_for_stats.mean(dim=1, keepdim=True)
-            t_std = t_part_for_stats.std(dim=1, keepdim=True)
+            # 获取 Teacher 的最大概率和对应的 Label
+            # 注意：这里我们在所有类别(含背景)中找最大值，以正确判断 Teacher 的置信度
+            t_max_prob, t_label = t_probs.max(dim=1)
             
-            # 定义对齐函数：把 T 映射到 S 的尺度
-            def align(x):
-                return (x - t_mean) / (t_std + 1e-6) * s_std + s_mean
-
-            # 对齐 Teacher 的旧类部分
-            t_logits_old_aligned = align(t_logits_old)
+            # === 策略 A: 动态阈值 (Statistical Selection) ===
+            batch_mean = t_max_prob.mean()
+            batch_std = t_max_prob.std()
             
-            # 【关键】同时也对齐 Teacher 的背景部分
-            # 因为我们要把这个值填进 Target，它必须和 Student 的尺度一致
-            t_logits_bg_aligned = align(t_logits_bg)
+            # 动态阈值：选取显著高于平均水平的样本
+            dynamic_threshold = batch_mean + 0.5 * batch_std 
+            # 保底阈值，防止所有样本都被选中引入噪声
+            dynamic_threshold = torch.max(dynamic_threshold, torch.tensor(0.01, device=t_max_prob.device))
 
-        # =====================================================================
-        # 3. 动态背景选择 (Selective Background) - 你的 Idea
-        # =====================================================================
-        with torch.no_grad():
-            # 判断 Teacher 认为这是不是旧物体
-            # 比较 Teacher 原始 Logits: 最高旧类分 vs 背景分
-            t_max_old, _ = t_logits_old.max(dim=1, keepdim=True)
-            is_teacher_fg = t_max_old > t_logits_bg
+            # 生成 Mask：只有 Teacher 确信的样本才参与蒸馏
+            valid_mask = t_max_prob > dynamic_threshold
             
-            # 构造 Target 的背景部分：
-            # 如果是旧物体 -> 用 Teacher 的低背景分 (压制 Student)
-            # 如果是新物体/背景 -> 用 Student 自己的背景分 (保持现状)
-            target_bg_logit = torch.where(is_teacher_fg, t_logits_bg_aligned, s_logits_bg)
+            # === 策略 B: 弹性权重 (Elastic Weighting) ===
+            # 置信度越高，权重越大 (Power Law)
+            max_p = t_max_prob.max().clamp(min=1e-6)
+            distill_weight = torch.pow(t_max_prob / max_p, 2.0)
+            
+            # 应用 Mask
+            distill_weight = distill_weight * valid_mask.float()
 
-        # =====================================================================
-        # 4. 拼接生成 Target
-        # =====================================================================
-        # Target = [Teacher旧类, Student新类, 修正后的背景]
-        target_logits = torch.cat([
-            t_logits_old_aligned, 
-            s_logits_new, 
-            target_bg_logit
-        ], dim=1)
+            # num_cls_selected = valid_mask.sum().item()
+            
+            # # 计算参与回归蒸馏的数量 (需满足: 通过阈值 AND 是旧类前景)
+            # # 注意: t_label < old_end 意味着是前景 (假设 old_end 是背景的索引)
+            # is_fg_for_print = t_label < old_end
+            # num_reg_selected = (valid_mask & is_fg_for_print).sum().item()
+            
+            # # 打印 (格式: [总RoI数] -> [分类蒸馏数] | [回归蒸馏数])
+            # print(f"[Distill Debug] Total: {len(t_max_prob)} | "
+            #       f"Cls Selected: {num_cls_selected} | "
+            #       f"Reg Selected: {num_reg_selected}")
 
-        # =====================================================================
-        # 5. 计算 KL Loss
-        # =====================================================================
-        T = 1.0
-        loss_dist = F.kl_div(
-            F.log_softmax(s_cls_score / T, dim=1),
-            F.softmax(target_logits / T, dim=1),
-            reduction='batchmean'
-        )
+            # 如果本 Batch 没有有效样本，直接返回 0
+            if distill_weight.sum() == 0:
+                return {
+                    'loss_roi_dist_cls': s_cls_score.sum() * 0.0,
+                    'loss_roi_dist_bbox': student_results['bbox_pred'].sum() * 0.0
+                }
 
-        losses['loss_roi_dist_cls'] = loss_dist * 2.0 # 建议权重稍微大一点，因为 KL 比较软
+        # -------------------------------------------------
+        # 2. Class Distillation (概率聚合策略 - 关键修改)
+        # -------------------------------------------------
+        # 目的：让 Student [旧类, 新类+背景] 的概率分布 去拟合 Teacher [旧类, 背景]
+        
+        # 1. 计算 Student 的概率
+        s_probs = F.softmax(s_cls_score / T, dim=1) # [N, old_end + num_new + 1]
+        
+        # 2. 拆分并聚合
+        # 旧类别部分 (0 ~ old_end-1)
+        s_probs_old = s_probs[:, :old_end] 
+        
+        # 广义背景部分：将 Student 的 [所有新类] + [背景] 加起来
+        # 对应 Teacher 的 [背景] 通道
+        s_probs_new_bg_aggregated = s_probs[:, old_end:].sum(dim=1, keepdim=True)
+        
+        # 3. 拼接成对齐后的分布 [N, old_end + 1]
+        s_probs_aligned = torch.cat([s_probs_old, s_probs_new_bg_aggregated], dim=1)
+        
+        # 4. 计算 KL 散度
+        # F.kl_div 输入要求：input 是 log_softmax，target 是 probabilities
+        # 所以我们需要对 s_probs_aligned 取 log
+        loss_cls_per_sample = F.kl_div(
+            torch.log(s_probs_aligned + 1e-8), 
+            t_probs, 
+            reduction='none'
+        ).sum(dim=1) # [N]
+        
+        # 5. 应用 ERD 权重
+        losses['loss_roi_dist_cls'] = (loss_cls_per_sample * distill_weight).sum() / distill_weight.sum()
 
+        # -------------------------------------------------
+        # 3. BBox Distillation (ERD 加权回归)
+        # -------------------------------------------------
         s_bbox_pred = student_results['bbox_pred']
         t_bbox_pred = teacher_results['bbox_pred']
-        t_cls_score = teacher_results['cls_score']
 
         if s_bbox_pred is not None and t_bbox_pred is not None:
-            # 1. 确定哪些样本需要蒸馏
-            # 逻辑：只蒸馏 Teacher 确信是 "旧类" 的样本
-            with torch.no_grad():
-                t_probs = F.softmax(t_cls_score, dim=1)
-                
-                # 只看旧类通道 (0 ~ old_end)
-                # 获取每个样本在旧类中的最大概率和对应的类别索引
-                t_max_prob, t_label = t_probs[:, :old_end].max(dim=1)
-                
-                # 筛选条件：概率 > 0.6 且属于旧类范围
-                # (t_label < old_end 其实是废话，因为我们切片了，但逻辑上是这样)
-                valid_mask = t_max_prob > 0.6
+            # 前景掩码：只有 Teacher 认为是前景物体时，才蒸馏 BBox
+            # 假设 Teacher 的背景类索引是 old_end (即最后一个通道)
+            is_fg = t_label < old_end
             
-            # 如果有有效的样本，才计算 Loss
-            if valid_mask.sum() > 0:
+            # 只有同时满足 [ERD阈值筛选] 和 [Teacher认为是前景] 两个条件，才计算回归损失
+            bbox_weight = distill_weight * is_fg.float()
+            
+            if bbox_weight.sum() > 0:
+                N = s_bbox_pred.shape[0]
+                indices = torch.arange(N, device=s_bbox_pred.device)
                 
-                # 2. 处理 Class-Specific 回归维度 [N, C*4]
-                # 检查是否是共享回归 (shape[1] == 4) 还是分列回归 (shape[1] > 4)
-                if s_bbox_pred.shape[1] > 4:
-                    # 获取 Teacher 预测的类别对应的 4 个坐标
-                    # t_label 是 [N]，需要扩展成索引取值
-                    
-                    # 重新 reshape: [N, C*4] -> [N, C, 4]
-                    N = s_bbox_pred.shape[0]
-                    s_bbox_reshaped = s_bbox_pred.view(N, -1, 4)
-                    t_bbox_reshaped = t_bbox_pred.view(N, -1, 4)
-                    
-                    # 只取出 valid_mask 为 True 的行
-                    s_valid = s_bbox_reshaped[valid_mask]
-                    t_valid = t_bbox_reshaped[valid_mask]
-                    labels_valid = t_label[valid_mask]
-                    
-                    # 从 [M, C, 4] 中取出 [M, 4]，利用 gather 或索引
-                    # 这里用 range 索引比较直观
-                    indices = torch.arange(len(labels_valid), device=s_bbox_pred.device)
-                    
-                    s_target_box = s_valid[indices, labels_valid]
-                    t_target_box = t_valid[indices, labels_valid]
-                    
+                # --- 对齐 Student 的框 ---
+                if s_bbox_pred.shape[1] > 4: 
+                    # Class Specific: 取 Teacher 预测类别对应的通道
+                    s_target_box = s_bbox_pred.view(N, -1, 4)[indices, t_label]
                 else:
-                    # Class Agnostic (只有4个值)，直接取
-                    s_target_box = s_bbox_pred[valid_mask]
-                    t_target_box = t_bbox_pred[valid_mask]
+                    # Class Agnostic: 直接取
+                    s_target_box = s_bbox_pred
 
-                # 3. 计算 Smooth L1 Loss
-                # 为什么不用 MSE？回归值可能有离群点，MSE 平方后梯度太大，容易重现之前的爆炸
-                loss_dist_bbox = F.smooth_l1_loss(s_target_box, t_target_box, reduction='mean')
+                # --- 对齐 Teacher 的框 ---
+                if t_bbox_pred.shape[1] > 4:
+                    t_target_box = t_bbox_pred.view(N, -1, 4)[indices, t_label]
+                else:
+                    t_target_box = t_bbox_pred
+
+                # 计算 Smooth L1 Loss
+                loss_bbox_per_sample = F.smooth_l1_loss(
+                    s_target_box, 
+                    t_target_box, 
+                    reduction='none'
+                ).sum(dim=1) # Sum over coordinates [dx, dy, dw, dh]
                 
-                # 4. 权重配置
-                # 建议 1.0 或 2.0，不需要像 CLS 那么大
-                losses['loss_roi_dist_bbox'] = loss_dist_bbox * 2.0
+                # 应用权重
+                losses['loss_roi_dist_bbox'] = (loss_bbox_per_sample * bbox_weight).sum() / bbox_weight.sum()
+            else:
+                losses['loss_roi_dist_bbox'] = s_bbox_pred.sum() * 0.0
 
         return losses
 
@@ -558,71 +567,71 @@ class CatSegMaskRoIHead(StandardRoIHead):
 
         rois = bbox2roi([res.bboxes for res in sampling_results])
 
-        if (x_old is not None) and (cat_seg_logits_old is not None) and (teacher_indices is not None):
+        # if (x_old is not None) and (cat_seg_logits_old is not None) and (teacher_indices is not None):
             
-            with torch.no_grad():
-                # --- 1. 直接复用你的匹配逻辑 (完全照搬) ---
-                s_idx_exp = topk_indices.unsqueeze(2)
-                t_idx_exp = teacher_indices.unsqueeze(1)
-                match_matrix = (s_idx_exp == t_idx_exp)
-                is_old = s_idx_exp < old_end
-                valid_match = match_matrix & is_old
-                matches = torch.nonzero(valid_match, as_tuple=True)
-                b_idx, s_ch, t_ch = matches
+        #     with torch.no_grad():
+        #         # --- 1. 直接复用你的匹配逻辑 (完全照搬) ---
+        #         s_idx_exp = topk_indices.unsqueeze(2)
+        #         t_idx_exp = teacher_indices.unsqueeze(1)
+        #         match_matrix = (s_idx_exp == t_idx_exp)
+        #         is_old = s_idx_exp < old_end
+        #         valid_match = match_matrix & is_old
+        #         matches = torch.nonzero(valid_match, as_tuple=True)
+        #         b_idx, s_ch, t_ch = matches
 
-                # --- 2. 准备 Soft Protection Mask ---
-                # 初始化一个全 0 的 Mask [B, H, W]
-                # device 保持一致
-                B_size, _, H_size, W_size = cat_seg_logits_old.shape
-                spatial_protection_mask = torch.zeros((B_size, H_size, W_size), 
-                                                      device=cat_seg_logits_old.device)
+        #         # --- 2. 准备 Soft Protection Mask ---
+        #         # 初始化一个全 0 的 Mask [B, H, W]
+        #         # device 保持一致
+        #         B_size, _, H_size, W_size = cat_seg_logits_old.shape
+        #         spatial_protection_mask = torch.zeros((B_size, H_size, W_size), 
+        #                                               device=cat_seg_logits_old.device)
 
-                if b_idx.numel() > 0:
-                    # 提取 Teacher 对应通道的 Mask Logits [N_match, H, W]
-                    t_mask_logits = cat_seg_logits_old[b_idx, t_ch]
+        #         if b_idx.numel() > 0:
+        #             # 提取 Teacher 对应通道的 Mask Logits [N_match, H, W]
+        #             t_mask_logits = cat_seg_logits_old[b_idx, t_ch]
                     
-                    # 转为概率 (0~1) -> 这就是我们要的"软权重"
-                    t_mask_prob = torch.sigmoid(t_mask_logits)
+        #             # 转为概率 (0~1) -> 这就是我们要的"软权重"
+        #             t_mask_prob = torch.sigmoid(t_mask_logits)
                     
-                    # --- 3. 聚合 Mask (Scatter Max) ---
-                    # 因为一个 batch 里可能匹配到多个旧类 (比如既有猫又有狗)
-                    # 我们取它们概率的最大值，作为该像素的最终保护力度
+        #             # --- 3. 聚合 Mask (Scatter Max) ---
+        #             # 因为一个 batch 里可能匹配到多个旧类 (比如既有猫又有狗)
+        #             # 我们取它们概率的最大值，作为该像素的最终保护力度
                     
-                    # 为了效率，我们遍历本次 batch 中涉及到的 b_idx
-                    unique_b = torch.unique(b_idx)
-                    for b in unique_b:
-                        # 找到属于这个 sample 的所有匹配 mask
-                        mask_indices = (b_idx == b)
-                        probs_in_batch = t_mask_prob[mask_indices] # [M, H, W]
+        #             # 为了效率，我们遍历本次 batch 中涉及到的 b_idx
+        #             unique_b = torch.unique(b_idx)
+        #             for b in unique_b:
+        #                 # 找到属于这个 sample 的所有匹配 mask
+        #                 mask_indices = (b_idx == b)
+        #                 probs_in_batch = t_mask_prob[mask_indices] # [M, H, W]
                         
-                        # 取最大值: 只要任意一个旧类说这里是它，我们就保护这里
-                        if probs_in_batch.shape[0] > 0:
-                            max_prob, _ = probs_in_batch.max(dim=0)
-                            spatial_protection_mask[b] = max_prob
+        #                 # 取最大值: 只要任意一个旧类说这里是它，我们就保护这里
+        #                 if probs_in_batch.shape[0] > 0:
+        #                     max_prob, _ = probs_in_batch.max(dim=0)
+        #                     spatial_protection_mask[b] = max_prob
                 
-                # 增加通道维度 [B, H, W] -> [B, 1, H, W]
-                spatial_protection_mask = spatial_protection_mask.unsqueeze(1)
+        #         # 增加通道维度 [B, H, W] -> [B, 1, H, W]
+        #         spatial_protection_mask = spatial_protection_mask.unsqueeze(1)
 
-            # --- 4. 定义 Soft Hook ---
-            def get_soft_gradient_mask_hook(mask_resized):
-                def hook(grad):
-                    # [关键改动] 软截断
-                    # grad * (1.0 - probability)
-                    # 概率越高，保留的梯度越少
-                    return grad * (1.0 - mask_resized)
-                return hook
+        #     # --- 4. 定义 Soft Hook ---
+        #     def get_soft_gradient_mask_hook(mask_resized):
+        #         def hook(grad):
+        #             # [关键改动] 软截断
+        #             # grad * (1.0 - probability)
+        #             # 概率越高，保留的梯度越少
+        #             return grad * (1.0 - mask_resized)
+        #         return hook
 
-            # --- 5. 注册 Hook ---
-            new_x = []
-            for feat in x:
-                if feat.requires_grad:
-                    B, C, H, W = feat.shape
-                    # 插值到当前特征层大小
-                    mask_resized = F.interpolate(spatial_protection_mask, size=(H, W), mode='bilinear', align_corners=False).detach()
-                    # 注册
-                    feat.register_hook(get_soft_gradient_mask_hook(mask_resized))
-                new_x.append(feat)
-            x = tuple(new_x)
+        #     # --- 5. 注册 Hook ---
+        #     new_x = []
+        #     for feat in x:
+        #         if feat.requires_grad:
+        #             B, C, H, W = feat.shape
+        #             # 插值到当前特征层大小
+        #             mask_resized = F.interpolate(spatial_protection_mask, size=(H, W), mode='bilinear', align_corners=False).detach()
+        #             # 注册
+        #             feat.register_hook(get_soft_gradient_mask_hook(mask_resized))
+        #         new_x.append(feat)
+        #     x = tuple(new_x)
         # 传入cat_seg_feats
         # topk_indices = self._inject_gt_to_topk(topk_indices, gt_labels, k_old=5)
         bbox_results = self._bbox_forward(x, rois, cat_seg_feats=cat_seg_feats, topk_indices=topk_indices, x_old=x_old, old_end=old_end)

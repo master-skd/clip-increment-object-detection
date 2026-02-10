@@ -690,7 +690,7 @@ class Aggregator(nn.Module):
         corr_embed = rearrange(corr_embed, '(B T) () H W -> B T H W', B=B)
         return corr_embed
     
-    def forward(self, img_feats, text_feats, appearance_guidance):
+    def forward(self, img_feats, text_feats, appearance_guidance, force_indices=None):
         """
         Arguments:
             img_feats: (B, C, H, W)
@@ -698,9 +698,22 @@ class Aggregator(nn.Module):
             appearance_guidance: tuple of (B, C, H, W)
         """
         classes = None
+        topk_indices = None
 
         corr = self.correlation(img_feats, text_feats) # shape = [B, P, T, H, W]
-        if self.pad_len > 0 and text_feats.size(1) > self.pad_len:
+
+        # !=== 新增: 强制对齐逻辑 ===
+        if force_indices is not None:
+            classes = force_indices
+            th_text = F.normalize(text_feats, dim=-1)
+            gather_index = classes[..., None, None].expand(-1, -1, th_text.size(-2), th_text.size(-1))
+            th_text = torch.gather(th_text, dim=1, index=gather_index)
+            img_feats = F.normalize(img_feats, dim=1)
+            corr = torch.einsum('bchw, bkpc -> bpkhw', img_feats, th_text)
+            topk_indices = classes
+            text_feats = th_text
+
+        elif self.pad_len > 0 and text_feats.size(1) > self.pad_len:
             K = self.pad_len
             old_end = getattr(self, 'old_end', 19)  # 0-18 old, 19-... new
             # 建议 pad_len=8 时 old 保底 2 个
@@ -1082,8 +1095,63 @@ class CatSegEvaCLIPViT(BaseModule):
             outs[idx] = interpolate(out.detach())
         outs.append(logits)
         outs.append(topk_indices)
-        outs.append(img_feats) if self.training else outs.append(None)
+        outs.append(img_feats) if not self.training else outs.append(None)
         return outs  # 4个多尺度特征 + 最终logits
+    
+    def forward_with_text(self, x, text_feats_override, force_indices=None):
+        visual = self.visual
+        bs, _, h, w = x.shape
+        h = h // visual.patch_embed.patch_size[0]
+        w = w // visual.patch_embed.patch_size[1]
+
+        with torch.no_grad():
+            x = visual.patch_embed(x)
+            batch_size, seq_len, _ = x.size()
+            cls_tokens = visual.cls_token.expand(batch_size, -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1)
+            if visual.pos_embed is not None:
+                x = x + visual.rescale_positional_embedding(out_size=(h, w))
+            x = visual.pos_drop(x)
+            x = visual.patch_dropout(x)
+            
+            rel_pos_bias = visual.rel_pos_bias() if visual.rel_pos_bias is not None else None
+
+            res = []
+            for i, blk in enumerate(visual.blocks[:-1]):
+                x = blk(x, rel_pos_bias=rel_pos_bias)
+                if i in self.cat_seg_indices:
+                    res.append(self._expand_x(x, h, w))
+            x = visual.blocks[-1].forward_without_attn(x)
+            if (len(visual.blocks) - 1) in self.cat_seg_indices:
+                res.append(self._expand_x(x, h, w))
+            
+            img_feats = x[:, 1:]
+            img_feats = visual.norm(img_feats)
+            img_feats = visual.head(img_feats)
+            img_feats = F.normalize(img_feats, dim=-1)
+            img_feats = img_feats.view(bs, h, w, -1).permute(0, 3, 1, 2)
+
+        # B. 准备文本特征 (使用传入的 Teacher 文本)
+        # text_feats_override: [T_teacher, P, C] -> [B, T_teacher, P, C]
+        text_feats = text_feats_override.unsqueeze(0).expand(bs, -1, -1, -1)
+        text_feats = text_feats.to(x.device).to(x.dtype)
+
+        # C. 准备 Guidance
+        res3 = img_feats
+        res4 = res[0]
+        res5 = res[1]
+        res4 = self.upsample1(res4)
+        res5 = self.upsample2(res5)
+
+        # D. 调用 Aggregator (强制使用 Teacher 的 indices)
+        logits, _ = self.seg_decoder(
+            img_feats, 
+            text_feats, 
+            appearance_guidance=[res3, res4, res5],
+            force_indices=force_indices # <--- 传进去
+        )
+        
+        return logits
 
     def _expand_x(self, x, h, w):
         # x: bs q c

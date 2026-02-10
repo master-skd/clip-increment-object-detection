@@ -11,3 +11,4 @@ datasets/__pycache__/
 .vscode/
 tools/__pycache__
 /vis_results/
+./debug_vis_results
