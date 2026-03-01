@@ -12,7 +12,7 @@ model = dict(
     type='CatSegDetector',
 
     old_cfg='/mnt/data14/yyg/F-ViT/configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask.py',
-    old_ckpt="runs/cat-seg/test_train_task1_10_2d_pseudo_label/epoch_40.pth",
+    old_ckpt="/mnt/data14/yyg/F-ViT/runs/cat-seg/test_train_task1_10_2d_decouple_distill_all_pseudo_label_sigmoid/epoch_11.pth",
     use_feature_routing=True,
     old_end=19,
     backbone=dict(
@@ -118,7 +118,7 @@ model = dict(
                 target_stds=[0.1, 0.1, 0.2, 0.2],
             ),
             loss_cls=dict(
-                type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0
+                type='BCEWithLogitsLoss', loss_weight=1.0
             ),
             # loss_cls=dict(
             #     type='CustomCrossEntropyLoss',
@@ -204,7 +204,7 @@ model = dict(
             min_bbox_size=0
         ),
         rcnn=dict(
-            score_thr=0.01,
+            score_thr=0.001,
             nms=dict(type='nms', iou_threshold=0.4),
             max_per_img=100
         )
@@ -215,7 +215,7 @@ checkpoint_config = dict(interval=1)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-load_from = 'runs/cat-seg/test_train_task1_10_2d_pseudo_label/epoch_40.pth'
+load_from = '/mnt/data14/yyg/F-ViT/runs/cat-seg/test_train_task1_10_2d_decouple_distill_all_pseudo_label_sigmoid/epoch_11.pth'
 resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0

@@ -78,7 +78,7 @@ model = dict(
             roi_feat_size=7,
             text_dim=512,
             num_classes=num_classes,
-            reg_class_agnostic=False,
+            reg_class_agnostic=True,
             norm_cfg=norm_cfg,
             # fixed_temperature=0,
             learn_bg=False,
@@ -95,7 +95,7 @@ model = dict(
                 target_stds=[0.1, 0.1, 0.2, 0.2],
             ),
             loss_cls=dict(
-                type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0
+                type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0
             ),
             loss_bbox=dict(type='L1Loss', loss_weight=1.0),
             num_shared_convs=4,
@@ -176,7 +176,7 @@ model = dict(
             min_bbox_size=0
         ),
         rcnn=dict(
-            score_thr=0.01,
+            score_thr=0.001,
             nms=dict(type='nms', iou_threshold=0.4),
             max_per_img=100
         )

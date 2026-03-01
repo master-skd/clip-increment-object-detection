@@ -383,152 +383,372 @@ class CatSegMaskRoIHead(StandardRoIHead):
 
         return tuple(weighted_feats)
 
-    def compute_roi_distillation_loss(self, student_results, teacher_results, old_end):
-        """
-        计算 R-CNN 阶段的 ERD 蒸馏损失 (支持 Softmax 分类头)
+    # def compute_roi_distillation_loss(self, student_results, teacher_results, old_end):
+    #     """
+    #     计算 R-CNN 阶段的 ERD 蒸馏损失 (支持 Softmax 分类头)
         
-        Args:
-            student_results (dict): Student 的 RoI 预测结果，包含 'cls_score' 和 'bbox_pred'
-            teacher_results (dict): Teacher 的 RoI 预测结果
-            old_end (int): 旧类别数量 (不含背景)。例如 Task1 有 40 类，则 old_end=40。
-                            假设 Student 的通道排列为 [0~39 (旧), 40~79 (新), 80 (背景)]
-                            假设 Teacher 的通道排列为 [0~39 (旧), 40 (背景)]
-        """
+    #     Args:
+    #         student_results (dict): Student 的 RoI 预测结果，包含 'cls_score' 和 'bbox_pred'
+    #         teacher_results (dict): Teacher 的 RoI 预测结果
+    #         old_end (int): 旧类别数量 (不含背景)。例如 Task1 有 40 类，则 old_end=40。
+    #                         假设 Student 的通道排列为 [0~39 (旧), 40~79 (新), 80 (背景)]
+    #                         假设 Teacher 的通道排列为 [0~39 (旧), 40 (背景)]
+    #     """
+    #     losses = {}
+    #     s_cls_score = student_results['cls_score']
+    #     t_cls_score = teacher_results['cls_score']
+        
+    #     # 基础检查
+    #     if s_cls_score is None or t_cls_score is None:
+    #         return losses
+
+    #     # -------------------------------------------------
+    #     # 1. 计算 Teacher 的统计量与弹性权重 (ERD Core)
+    #     # -------------------------------------------------
+    #     with torch.no_grad():
+    #         T = 1.0 # 蒸馏温度
+    #         # Teacher 的 Softmax 概率
+    #         t_probs = F.softmax(t_cls_score / T, dim=1) # [N, old_end + 1]
+            
+    #         # 获取 Teacher 的最大概率和对应的 Label
+    #         # 注意：这里我们在所有类别(含背景)中找最大值，以正确判断 Teacher 的置信度
+    #         t_max_prob, t_label = t_probs.max(dim=1)
+            
+    #         # === 策略 A: 动态阈值 (Statistical Selection) ===
+    #         batch_mean = t_max_prob.mean()
+    #         batch_std = t_max_prob.std()
+            
+    #         # 动态阈值：选取显著高于平均水平的样本
+    #         dynamic_threshold = batch_mean + 0.5 * batch_std 
+    #         # 保底阈值，防止所有样本都被选中引入噪声
+    #         dynamic_threshold = torch.max(dynamic_threshold, torch.tensor(0.01, device=t_max_prob.device))
+
+    #         # 生成 Mask：只有 Teacher 确信的样本才参与蒸馏
+    #         valid_mask = t_max_prob > dynamic_threshold
+            
+    #         # === 策略 B: 弹性权重 (Elastic Weighting) ===
+    #         # 置信度越高，权重越大 (Power Law)
+    #         max_p = t_max_prob.max().clamp(min=1e-6)
+    #         distill_weight = torch.pow(t_max_prob / max_p, 2.0)
+            
+    #         # 应用 Mask
+    #         distill_weight = distill_weight * valid_mask.float()
+
+    #         # num_cls_selected = valid_mask.sum().item()
+            
+    #         # # 计算参与回归蒸馏的数量 (需满足: 通过阈值 AND 是旧类前景)
+    #         # # 注意: t_label < old_end 意味着是前景 (假设 old_end 是背景的索引)
+    #         # is_fg_for_print = t_label < old_end
+    #         # num_reg_selected = (valid_mask & is_fg_for_print).sum().item()
+            
+    #         # # 打印 (格式: [总RoI数] -> [分类蒸馏数] | [回归蒸馏数])
+    #         # print(f"[Distill Debug] Total: {len(t_max_prob)} | "
+    #         #       f"Cls Selected: {num_cls_selected} | "
+    #         #       f"Reg Selected: {num_reg_selected}")
+
+    #         # 如果本 Batch 没有有效样本，直接返回 0
+    #         if distill_weight.sum() == 0:
+    #             return {
+    #                 'loss_roi_dist_cls': s_cls_score.sum() * 0.0,
+    #                 'loss_roi_dist_bbox': student_results['bbox_pred'].sum() * 0.0
+    #             }
+
+    #     # -------------------------------------------------
+    #     # 2. Class Distillation (概率聚合策略 - 关键修改)
+    #     # -------------------------------------------------
+    #     # 目的：让 Student [旧类, 新类+背景] 的概率分布 去拟合 Teacher [旧类, 背景]
+        
+    #     # 1. 计算 Student 的概率
+    #     s_probs = F.softmax(s_cls_score / T, dim=1) # [N, old_end + num_new + 1]
+        
+    #     # 2. 拆分并聚合
+    #     # 旧类别部分 (0 ~ old_end-1)
+    #     s_probs_old = s_probs[:, :old_end] 
+        
+    #     # 广义背景部分：将 Student 的 [所有新类] + [背景] 加起来
+    #     # 对应 Teacher 的 [背景] 通道
+    #     s_probs_new_bg_aggregated = s_probs[:, old_end:].sum(dim=1, keepdim=True)
+        
+    #     # 3. 拼接成对齐后的分布 [N, old_end + 1]
+    #     s_probs_aligned = torch.cat([s_probs_old, s_probs_new_bg_aggregated], dim=1)
+        
+    #     # 4. 计算 KL 散度
+    #     # F.kl_div 输入要求：input 是 log_softmax，target 是 probabilities
+    #     # 所以我们需要对 s_probs_aligned 取 log
+    #     loss_cls_per_sample = F.kl_div(
+    #         torch.log(s_probs_aligned + 1e-8), 
+    #         t_probs, 
+    #         reduction='none'
+    #     ).sum(dim=1) # [N]
+        
+    #     # 5. 应用 ERD 权重
+    #     losses['loss_roi_dist_cls'] = (loss_cls_per_sample * distill_weight).sum() / distill_weight.sum()
+
+    #     # -------------------------------------------------
+    #     # 3. BBox Distillation (ERD 加权回归)
+    #     # -------------------------------------------------
+    #     s_bbox_pred = student_results['bbox_pred']
+    #     t_bbox_pred = teacher_results['bbox_pred']
+
+    #     if s_bbox_pred is not None and t_bbox_pred is not None:
+    #         # 前景掩码：只有 Teacher 认为是前景物体时，才蒸馏 BBox
+    #         # 假设 Teacher 的背景类索引是 old_end (即最后一个通道)
+    #         is_fg = t_label < old_end
+            
+    #         # 只有同时满足 [ERD阈值筛选] 和 [Teacher认为是前景] 两个条件，才计算回归损失
+    #         bbox_weight = distill_weight * is_fg.float()
+            
+    #         if bbox_weight.sum() > 0:
+    #             N = s_bbox_pred.shape[0]
+    #             indices = torch.arange(N, device=s_bbox_pred.device)
+                
+    #             # --- 对齐 Student 的框 ---
+    #             if s_bbox_pred.shape[1] > 4: 
+    #                 # Class Specific: 取 Teacher 预测类别对应的通道
+    #                 s_target_box = s_bbox_pred.view(N, -1, 4)[indices, t_label]
+    #             else:
+    #                 # Class Agnostic: 直接取
+    #                 s_target_box = s_bbox_pred
+
+    #             # --- 对齐 Teacher 的框 ---
+    #             if t_bbox_pred.shape[1] > 4:
+    #                 t_target_box = t_bbox_pred.view(N, -1, 4)[indices, t_label]
+    #             else:
+    #                 t_target_box = t_bbox_pred
+
+    #             # 计算 Smooth L1 Loss
+    #             loss_bbox_per_sample = F.smooth_l1_loss(
+    #                 s_target_box, 
+    #                 t_target_box, 
+    #                 reduction='none'
+    #             ).sum(dim=1) # Sum over coordinates [dx, dy, dw, dh]
+                
+    #             # 应用权重
+    #             losses['loss_roi_dist_bbox'] = (loss_bbox_per_sample * bbox_weight).sum() / bbox_weight.sum()
+    #         else:
+    #             losses['loss_roi_dist_bbox'] = s_bbox_pred.sum() * 0.0
+
+    #     return losses
+
+    def compute_roi_distillation_loss_previous(self, student_results, teacher_results, old_end):
         losses = {}
-        s_cls_score = student_results['cls_score']
-        t_cls_score = teacher_results['cls_score']
-        
-        # 基础检查
+        s_cls_score = student_results.get('cls_score', None)
+        t_cls_score = teacher_results.get('cls_score', None)
+        s_bbox_pred = student_results.get('bbox_pred', None)
+        t_bbox_pred = teacher_results.get('bbox_pred', None)
         if s_cls_score is None or t_cls_score is None:
             return losses
-
-        # -------------------------------------------------
-        # 1. 计算 Teacher 的统计量与弹性权重 (ERD Core)
-        # -------------------------------------------------
+        
+        # ------ 1) Teacher gating + ERD weights(old-only) -------
         with torch.no_grad():
-            T = 1.0 # 蒸馏温度
-            # Teacher 的 Softmax 概率
-            t_probs = F.softmax(t_cls_score / T, dim=1) # [N, old_end + 1]
-            
-            # 获取 Teacher 的最大概率和对应的 Label
-            # 注意：这里我们在所有类别(含背景)中找最大值，以正确判断 Teacher 的置信度
-            t_max_prob, t_label = t_probs.max(dim=1)
-            
-            # === 策略 A: 动态阈值 (Statistical Selection) ===
-            batch_mean = t_max_prob.mean()
-            batch_std = t_max_prob.std()
-            
-            # 动态阈值：选取显著高于平均水平的样本
-            dynamic_threshold = batch_mean + 0.5 * batch_std 
-            # 保底阈值，防止所有样本都被选中引入噪声
-            dynamic_threshold = torch.max(dynamic_threshold, torch.tensor(0.01, device=t_max_prob.device))
+            T = 2.0
+            # ! 原先
+            # Teacher probs over [old + bg]
+            # t_probs_all = F.softmax(t_cls_score / T, dim=1)
+            # t_bg_prob = t_probs_all[:, old_end]
 
-            # 生成 Mask：只有 Teacher 确信的样本才参与蒸馏
-            valid_mask = t_max_prob > dynamic_threshold
-            
-            # === 策略 B: 弹性权重 (Elastic Weighting) ===
-            # 置信度越高，权重越大 (Power Law)
-            max_p = t_max_prob.max().clamp(min=1e-6)
-            distill_weight = torch.pow(t_max_prob / max_p, 2.0)
-            
-            # 应用 Mask
-            distill_weight = distill_weight * valid_mask.float()
+            # # Teacher old-subspace probs (conditional distillation uses old-subspace softmax)
+            # t_probs_old = F.softmax(t_cls_score[:, :old_end] / T, dim=1)
+            # t_fg_max, t_label_old = t_probs_old.max(dim=1)
 
-            # num_cls_selected = valid_mask.sum().item()
-            
-            # # 计算参与回归蒸馏的数量 (需满足: 通过阈值 AND 是旧类前景)
-            # # 注意: t_label < old_end 意味着是前景 (假设 old_end 是背景的索引)
-            # is_fg_for_print = t_label < old_end
-            # num_reg_selected = (valid_mask & is_fg_for_print).sum().item()
-            
-            # # 打印 (格式: [总RoI数] -> [分类蒸馏数] | [回归蒸馏数])
-            # print(f"[Distill Debug] Total: {len(t_max_prob)} | "
-            #       f"Cls Selected: {num_cls_selected} | "
-            #       f"Reg Selected: {num_reg_selected}")
+            # # ERD-style dynamic threshold (bud based on old fg confidence)
+            # batch_mean = t_fg_max.mean()
+            # batch_std = t_fg_max.std(unbiased=False)
+            # dynamic_threshold = batch_mean + 0.5 * batch_std
+            # dynamic_threshold = torch.max(dynamic_threshold, torch.tensor(0.2, device=t_fg_max.device))
 
-            # 如果本 Batch 没有有效样本，直接返回 0
+            # # Key: must be old-foreground AND stronger than bg (avoid bg-definition conflict)
+            # valid_mask = (t_fg_max > dynamic_threshold) & (t_fg_max > t_bg_prob)
+
+            # ! 修改
+            # 1) old-subspace softmax: 用于distill_weight和label
+            t_probs_old = F.softmax(t_cls_score[:, :old_end] / T, dim=1)
+            t_fg_max, t_label_old = t_probs_old.max(dim=1)
+            # 2) logit margin: 用于避免bg冲突（同一个logit空间比较）
+            t_old_logit_max,_ = t_cls_score[:, :old_end].max(dim=1)
+            t_bg_logit = t_cls_score[:, old_end]
+            margin = t_old_logit_max - t_bg_logit
+
+            # 3)用quantile控制蒸馏比例
+            q = 0.8
+            thr = torch.quantile(margin, 0.8)
+            valid_mask = margin > thr
+
+            # Elastic weights: confidence power-law
+            max_p = t_fg_max.max().clamp(min=1e-6)
+            distill_weight = torch.pow(t_fg_max / max_p, 2.0) * valid_mask.float()
+
+            sel = int(valid_mask.sum().item())
+            total = int(valid_mask.numel())
+            # print(f"[ROI-ERD-Q] total={total} sel={sel} sel_ratio={sel/total:.3f} q={q:.2f} thr={thr.item():.3f} "
+            #     f"margin(mean)={margin.mean().item():.3f} margin(std)={margin.std(unbiased=False).item():.3f} "
+            #     f"fgmax(mean)={t_fg_max.mean().item():.3f} fgmax(std)={t_fg_max.std(unbiased=False).item():.3f}")
+
+            # ===== DEBUG PRINT (low frequency) =====
+            # if self.training and (torch.rand(1).item() < 0.01):  # 1% 概率，避免刷屏
+            #     num_total = t_fg_max.numel()
+            #     num_sel = valid_mask.sum().item()
+            #     w_sum = distill_weight.sum().item()
+            #     w_max = distill_weight.max().item() if num_total > 0 else 0.0
+            #     w_mean = distill_weight.mean().item() if num_total > 0 else 0.0
+
+            #     print(
+            #         f"[ROI-ERD-GATE] total={num_total} sel={num_sel} "
+            #         f"thr={dynamic_threshold.item():.3f} "
+            #         f"fgmax(mean={batch_mean.item():.3f}, std={batch_std.item():.3f}, max={t_fg_max.max().item():.3f}) "
+            #         f"bgprob(mean={t_bg_prob.mean().item():.3f}, max={t_bg_prob.max().item():.3f}) "
+            #         f"w(sum={w_sum:.3f}, mean={w_mean:.3f}, max={w_max:.3f})"
+            #     )
+
+            # No selected sampled -> return 0 (keep graph)
             if distill_weight.sum() == 0:
-                return {
-                    'loss_roi_dist_cls': s_cls_score.sum() * 0.0,
-                    'loss_roi_dist_bbox': student_results['bbox_pred'].sum() * 0.0
-                }
+                losses['loss_roi_dist_cls'] = s_cls_score.sum() * 0.0
+                if s_bbox_pred is not None:
+                    losses['loss_roi_dist_bbox'] = s_bbox_pred.sum() * 0.0
+                return losses
+            
+        # ------ 2) Class distillation: KL in old subspace only -------
+        s_old = s_cls_score[valid_mask][:, :old_end]
+        t_old = t_cls_score[valid_mask][:, :old_end]
+        w = distill_weight[valid_mask]
 
-        # -------------------------------------------------
-        # 2. Class Distillation (概率聚合策略 - 关键修改)
-        # -------------------------------------------------
-        # 目的：让 Student [旧类, 新类+背景] 的概率分布 去拟合 Teacher [旧类, 背景]
-        
-        # 1. 计算 Student 的概率
-        s_probs = F.softmax(s_cls_score / T, dim=1) # [N, old_end + num_new + 1]
-        
-        # 2. 拆分并聚合
-        # 旧类别部分 (0 ~ old_end-1)
-        s_probs_old = s_probs[:, :old_end] 
-        
-        # 广义背景部分：将 Student 的 [所有新类] + [背景] 加起来
-        # 对应 Teacher 的 [背景] 通道
-        s_probs_new_bg_aggregated = s_probs[:, old_end:].sum(dim=1, keepdim=True)
-        
-        # 3. 拼接成对齐后的分布 [N, old_end + 1]
-        s_probs_aligned = torch.cat([s_probs_old, s_probs_new_bg_aggregated], dim=1)
-        
-        # 4. 计算 KL 散度
-        # F.kl_div 输入要求：input 是 log_softmax，target 是 probabilities
-        # 所以我们需要对 s_probs_aligned 取 log
-        loss_cls_per_sample = F.kl_div(
-            torch.log(s_probs_aligned + 1e-8), 
-            t_probs, 
-            reduction='none'
-        ).sum(dim=1) # [N]
-        
-        # 5. 应用 ERD 权重
-        losses['loss_roi_dist_cls'] = (loss_cls_per_sample * distill_weight).sum() / distill_weight.sum()
+        # old-subspace distributions
+        t_old_prob = F.softmax(t_old / T, dim=1)
+        s_old_logp = F.log_softmax(s_old / T, dim=1)
+        loss_cls_per = F.kl_div(s_old_logp, t_old_prob, reduction='none').sum(dim=1) * (T * T)
+        losses['loss_roi_dist_cls'] = (loss_cls_per * w).sum() / (w.sum() + 1e-6)
 
-        # -------------------------------------------------
-        # 3. BBox Distillation (ERD 加权回归)
-        # -------------------------------------------------
-        s_bbox_pred = student_results['bbox_pred']
-        t_bbox_pred = teacher_results['bbox_pred']
+        # if self.training and (torch.rand(1).item() < 0.01):
+        #     print(
+        #         f"[ROI-ERD-LOSS] M={w.numel()} "
+        #         f"loss_cls={losses['loss_roi_dist_cls'].item():.4f} "
+        #         f"loss_cls_per(mean={loss_cls_per.mean().item():.4f}, max={loss_cls_per.max().item():.4f}) "
+        #         f"w(mean={w.mean().item():.3f}, max={w.max().item():.3f})"
+        #     )
 
+        # -------- 3) BBox distillation: only on selected pseudo-old RoIs --------
         if s_bbox_pred is not None and t_bbox_pred is not None:
-            # 前景掩码：只有 Teacher 认为是前景物体时，才蒸馏 BBox
-            # 假设 Teacher 的背景类索引是 old_end (即最后一个通道)
-            is_fg = t_label < old_end
-            
-            # 只有同时满足 [ERD阈值筛选] 和 [Teacher认为是前景] 两个条件，才计算回归损失
-            bbox_weight = distill_weight * is_fg.float()
-            
-            if bbox_weight.sum() > 0:
-                N = s_bbox_pred.shape[0]
-                indices = torch.arange(N, device=s_bbox_pred.device)
-                
-                # --- 对齐 Student 的框 ---
-                if s_bbox_pred.shape[1] > 4: 
-                    # Class Specific: 取 Teacher 预测类别对应的通道
-                    s_target_box = s_bbox_pred.view(N, -1, 4)[indices, t_label]
-                else:
-                    # Class Agnostic: 直接取
-                    s_target_box = s_bbox_pred
+            s_bbox = s_bbox_pred[valid_mask]
+            t_bbox = t_bbox_pred[valid_mask]
 
-                # --- 对齐 Teacher 的框 ---
-                if t_bbox_pred.shape[1] > 4:
-                    t_target_box = t_bbox_pred.view(N, -1, 4)[indices, t_label]
-                else:
-                    t_target_box = t_bbox_pred
+            # teacher label within old subspace
+            with torch.no_grad():
+                t_label_sel = t_label_old[valid_mask]  # [M]
 
-                # 计算 Smooth L1 Loss
-                loss_bbox_per_sample = F.smooth_l1_loss(
-                    s_target_box, 
-                    t_target_box, 
-                    reduction='none'
-                ).sum(dim=1) # Sum over coordinates [dx, dy, dw, dh]
-                
-                # 应用权重
-                losses['loss_roi_dist_bbox'] = (loss_bbox_per_sample * bbox_weight).sum() / bbox_weight.sum()
+            if w.sum() > 0:
+                M = s_bbox.shape[0]
+                idx = torch.arange(M, device=s_bbox.device)
+
+                # Student alignment
+                if s_bbox.shape[1] > 4:
+                    s_target = s_bbox.view(M, -1, 4)[idx, t_label_sel]
+                else:
+                    s_target = s_bbox
+
+                # Teacher alignment
+                if t_bbox.shape[1] > 4:
+                    t_target = t_bbox.view(M, -1, 4)[idx, t_label_sel]
+                else:
+                    t_target = t_bbox
+
+                loss_bbox_per = F.smooth_l1_loss(s_target, t_target, reduction='none').sum(dim=1)  # [M]
+                losses['loss_roi_dist_bbox'] = (loss_bbox_per * w).sum() / (w.sum() + 1e-6)
             else:
                 losses['loss_roi_dist_bbox'] = s_bbox_pred.sum() * 0.0
 
         return losses
+
+    def compute_roi_distillation_loss(self, student_results, teacher_results, old_end):
+        losses = {}
+        s_cls_score = student_results.get('cls_score', None)
+        t_cls_score = teacher_results.get('cls_score', None)
+        s_bbox_pred = student_results.get('bbox_pred', None)
+        t_bbox_pred = teacher_results.get('bbox_pred', None)
+        if s_cls_score is None or t_cls_score is None:
+            return losses
+
+        # teacher: [old] ; student: [old + new]
+        s_old_logit_all = s_cls_score[:, :old_end]   # [N, old]
+        t_old_logit_all = t_cls_score[:, :old_end]   # [N, old]
+
+        # ------ 1) Teacher gating + ERD weights (old-only, sigmoid-space) ------
+        with torch.no_grad():
+            T = 1.0
+
+            # teacher old prob（逐类独立）
+            t_old_prob_all = torch.sigmoid(t_old_logit_all / T)    # [N, old]
+
+            # 用 old 子空间 max prob 作为 “foreground confidence”
+            t_conf, t_label_old = t_old_prob_all.max(dim=1)        # [N], [N]
+
+            # ===== ERD 动态阈值 =====
+            lam = 0.5
+            # thr_floor = 0.20   # 你原先 ROI 用过 0.2，可以先保留
+            mean = t_conf.mean()
+            std = t_conf.std(unbiased=False)
+            # dynamic_threshold = torch.max(mean + lam * std, t_conf.new_tensor(thr_floor))
+            dynamic_threshold = mean + lam * std
+
+            valid_mask = (t_conf > dynamic_threshold)              # [N]
+
+            # Elastic weights（沿用你原先的 power-law）
+            gamma = 2.0
+            max_p = t_conf.max().clamp(min=1e-6)
+            distill_weight = (t_conf / max_p).pow(gamma) * valid_mask.float()  # [N]
+
+            # 没选到就返回 0（保持图）
+            if distill_weight.sum() == 0:
+                losses['loss_roi_dist_cls'] = s_cls_score.sum() * 0.0
+                if s_bbox_pred is not None:
+                    losses['loss_roi_dist_bbox'] = s_bbox_pred.sum() * 0.0
+                return losses
+
+        # ------ 2) Class distillation: BCE(sigmoid) in old subspace only ------
+        s_old = s_old_logit_all[valid_mask]          # [M, old]
+        t_old = t_old_logit_all[valid_mask]          # [M, old]
+        w = distill_weight[valid_mask]               # [M]
+
+        with torch.no_grad():
+            t_target = torch.sigmoid(t_old / T)      # [M, old]
+
+        # BCEWithLogits：输入 logits，target 是 [0,1] 概率
+        bce = F.binary_cross_entropy_with_logits(s_old / T, t_target, reduction='none')  # [M, old]
+
+        # 对 old 维度求 mean（更稳，不会因为 old 类数变化导致尺度漂）
+        loss_cls_per = bce.mean(dim=1) * (T * T)     # [M]
+        losses['loss_roi_dist_cls'] = (loss_cls_per * w).sum() / (w.sum() + 1e-6)
+
+        # ------ 3) BBox distillation: 仍然只对选中的 RoIs ------
+        if s_bbox_pred is not None and t_bbox_pred is not None:
+            s_bbox = s_bbox_pred[valid_mask]
+            t_bbox = t_bbox_pred[valid_mask]
+
+            with torch.no_grad():
+                t_label_sel = t_label_old[valid_mask]  # [M]
+
+            if w.sum() > 0:
+                M = s_bbox.shape[0]
+                idx = torch.arange(M, device=s_bbox.device)
+
+                # Student alignment
+                if s_bbox.shape[1] > 4:
+                    s_target = s_bbox.view(M, -1, 4)[idx, t_label_sel]
+                else:
+                    s_target = s_bbox
+
+                # Teacher alignment
+                if t_bbox.shape[1] > 4:
+                    t_target = t_bbox.view(M, -1, 4)[idx, t_label_sel]
+                else:
+                    t_target = t_bbox
+
+                loss_bbox_per = F.smooth_l1_loss(s_target, t_target, reduction='none').sum(dim=1)  # [M]
+                losses['loss_roi_dist_bbox'] = (loss_bbox_per * w).sum() / (w.sum() + 1e-6)
+            else:
+                losses['loss_roi_dist_bbox'] = s_bbox_pred.sum() * 0.0
+
+        return losses
+
 
     def forward_train(self,
                       x,
@@ -671,34 +891,6 @@ class CatSegMaskRoIHead(StandardRoIHead):
             losses.update(loss_dist)
 
         return losses
-    
-    # def _inject_gt_to_topk(self, topk_indices, gt_labels, k_old=3):
-    #     if topk_indices is None:
-    #         return None
-    #     topk = topk_indices.clone()
-    #     B, K = topk.shape
-    #     device = topk.device
-
-    #     for i in range(B):
-    #         gt = torch.unique(gt_labels[i]).to(device=device, dtype=torch.long)
-    #         # 去掉非法
-    #         gt = gt[gt >= 0]
-    #         # 逐个注入缺失的 gt
-    #         for g in gt.tolist():
-    #             if (topk[i] == g).any():
-    #                 continue
-    #             # 优先替换 new 槽位（从尾到 k_old）
-    #             replaced = False
-    #             for pos in range(K - 1, k_old - 1, -1):
-    #                 if topk[i, pos].item() not in gt.tolist():
-    #                     topk[i, pos] = g
-    #                     replaced = True
-    #                     break
-    #             if not replaced:
-    #                 # 实在塞不进就跳过（一般不会发生）
-    #                 pass
-    #     return topk
-
 
     def _bbox_forward(self, x, rois, cat_seg_feats, topk_indices=None, x_old=None, old_end=19, vlm_feat=None):
         """
@@ -844,8 +1036,10 @@ class CatSegMaskBBoxHead(ConvFCBBoxHead):
 
         # 类别embedding
         assert class_embed is not None, "class_embed must be provided"
-        self.seen_classes = json.load(open(seen_classes)) + ['background']
-        self.all_classes = json.load(open(all_classes)) + ['background']
+        # self.seen_classes = json.load(open(seen_classes)) + ['background']
+        # self.all_classes = json.load(open(all_classes)) + ['background']
+        self.seen_classes = json.load(open(seen_classes))
+        self.all_classes = json.load(open(all_classes))
         idx = [self.all_classes.index(seen) for seen in self.seen_classes]
 
         # 创建类别掩码，标记novel类的位置
@@ -925,9 +1119,9 @@ class CatSegMaskBBoxHead(ConvFCBBoxHead):
         bbox_pred = self.fc_reg(x_reg) if self.with_reg else None
 
         if not self.training and normalized_vlm_box_feats is not None:
-            cls_score = cls_score.softmax(dim=-1)
+            cls_score = cls_score.sigmoid()
             vlm_score = (normalized_vlm_box_feats @ all_embed) * self.vlm_temperature
-            vlm_score = vlm_score.softmax(dim=-1)
+            vlm_score = vlm_score.sigmoid()
 
             cls_score[:, self.base_idx] = cls_score[:, self.base_idx] ** (
                 1 - self.alpha) * vlm_score[:, self.base_idx] ** self.alpha
@@ -945,8 +1139,9 @@ class CatSegMaskBBoxHead(ConvFCBBoxHead):
                    scale_factor,
                    rescale=False,
                    cfg=None):
-        scores = F.softmax(cls_score, dim=-1)
-        scores = scores[:, :-1]  # 去掉背景分数
+        # scores = F.softmax(cls_score, dim=-1)
+        # scores = scores[:, :-1]  # 去掉背景分数
+        scores = cls_score.sigmoid()
         if bbox_pred is not None:
             bboxes = self.bbox_coder.decode(
                 rois[..., 1:], bbox_pred, max_shape=img_shape
