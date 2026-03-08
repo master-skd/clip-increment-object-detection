@@ -21,51 +21,71 @@ class CatSegDetector(TwoStageDetector):
                  test_cfg,
                  pretrained=None,
                  init_cfg=None,
-                 pseudo_iou_thr=0.5,
-                 min_keep=512,
+                #  pseudo_iou_thr=0.5,
+                #  min_keep=512,
 
-                 old_cfg=None,
-                 old_ckpt=None,
-                 use_feature_routing=False,
-                 old_end=0,
+                #  old_cfg=None,
+                #  old_ckpt=None,
+                #  use_feature_routing=False,
+                #  old_end=0,
     ):
         super().__init__(backbone, neck, rpn_head, roi_head, train_cfg, test_cfg, pretrained, init_cfg)
-        self.pseudo_iou_thr = pseudo_iou_thr
-        self.min_keep = min_keep
+        # self.pseudo_iou_thr = pseudo_iou_thr
+        # self.min_keep = min_keep
 
-        self.use_feature_routing = use_feature_routing
-        self.old_cfg = old_cfg
-        self.old_ckpt = old_ckpt
-        self.old_end = old_end
+        # self.use_feature_routing = use_feature_routing
+        # self.old_cfg = old_cfg
+        # self.old_ckpt = old_ckpt
+        # self.old_end = old_end
 
-        self.old_model = None
-        if self.use_feature_routing and (old_cfg is not None) and (old_ckpt is not None):
-            self.old_model = self._build_old_model(old_cfg, old_ckpt)
+        # self.old_model = None
+        # if self.use_feature_routing and (old_cfg is not None) and (old_ckpt is not None):
+        #     self.old_model = self._build_old_model(old_cfg, old_ckpt)
+
 
         self.ortho_loss = SegOrthogonalLoss(loss_weight=0.5)
 
-    def _build_old_model(self, cfg_path, ckpt_path):
-        cfg = Config.fromfile(cfg_path)
+        # 1. 冻结 FPN (Neck)
+        if self.with_neck:
+            for param in self.neck.parameters():
+                param.requires_grad = False
+                
+        # 2. 冻结 RPN (Region Proposal Network)
+        if self.with_rpn:
+            for param in self.rpn_head.parameters():
+                param.requires_grad = False
 
-        # 防止 old config 里也写了 old_cfg/old_ckpt 递归
-        if isinstance(cfg.model, dict):
-            for k in ['old_cfg', 'old_ckpt', 'use_feature_routing', 'old_end',
-                      'teacher_cfg', 'teacher_ckpt', 'teacher_score_thr', 'teacher_box_dilation']:
-                cfg.model.pop(k, None)
+    def train(self, mode=True):
+        """Override train to keep frozen modules in eval mode."""
+        super().train(mode)
+        
+        if self.with_neck:
+            self.neck.eval()      # 强制 FPN 保持推理状态
+        if self.with_rpn:
+            self.rpn_head.eval()  # 强制 RPN 保持推理状态
 
-        old_model = build_detector(cfg.model,
-                                   train_cfg=cfg.get('train_cfg'),
-                                   test_cfg=cfg.get('test_cfg'))
+    # def _build_old_model(self, cfg_path, ckpt_path):
+    #     cfg = Config.fromfile(cfg_path)
 
-        # 这里 strict=False，避免你之前那种 unexpected key
-        print("loading teacher")
-        load_checkpoint(old_model, ckpt_path, map_location='cpu', strict=False)
-        print("loading teacher done!")
+    #     # 防止 old config 里也写了 old_cfg/old_ckpt 递归
+    #     if isinstance(cfg.model, dict):
+    #         for k in ['old_cfg', 'old_ckpt', 'use_feature_routing', 'old_end',
+    #                   'teacher_cfg', 'teacher_ckpt', 'teacher_score_thr', 'teacher_box_dilation']:
+    #             cfg.model.pop(k, None)
 
-        old_model.eval()
-        for p in old_model.parameters():
-            p.requires_grad_(False)
-        return old_model
+    #     old_model = build_detector(cfg.model,
+    #                                train_cfg=cfg.get('train_cfg'),
+    #                                test_cfg=cfg.get('test_cfg'))
+
+    #     # 这里 strict=False，避免你之前那种 unexpected key
+    #     print("loading teacher")
+    #     load_checkpoint(old_model, ckpt_path, map_location='cpu', strict=False)
+    #     print("loading teacher done!")
+
+    #     old_model.eval()
+    #     for p in old_model.parameters():
+    #         p.requires_grad_(False)
+    #     return old_model
 
     def simple_test(self, img, img_metas, proposals=None, rescale=False):
         assert self.with_bbox, 'Bbox head must be implemented.'
@@ -209,49 +229,49 @@ class CatSegDetector(TwoStageDetector):
         loss_rpn_reg = s_cls_scores[0].new_tensor(0.0)
         valid_levels = 0
 
-        # ===== ERD 超参（建议先用这组）=====
-        T = 1.0          # ERD 一般不强调温度；你要更软可试 2.0
-        lam = 0.5        # mean + lam * std
-        thr_floor = 0.10 # 很关键：避免 early stage 阈值过高导致几乎不选
-        gamma_cls = 2.0  # cls 权重 p^gamma
-        gamma_reg = 2.0  # reg 权重 p^gamma（你原来是 p^2）
+        T = 1.0          
+        lam = 0.5        
+        # 分类保底阈值：不需要太高，保护旧类的召回
+        thr_floor_cls = 0.15 
+        # 回归保底阈值：必须高！绝不能学 Teacher 瞎猜的框
+        thr_floor_reg = 0.45 
+        
+        gamma_cls = 2.0  
+        gamma_reg = 2.0  
 
         for lvl, (s_cls, s_reg, t_cls, t_reg) in enumerate(zip(
             s_cls_scores, s_bbox_preds, t_cls_scores, t_bbox_preds
         )):
-            # s_cls/t_cls: logits, shape 通常是 [B, A, H, W] 或 [B, A*C, H, W]
-            # 我们不假设具体维度，只做 per-image flatten
-
             with torch.no_grad():
-                # teacher prob（逐点独立二分类概率）
-                t_prob = torch.sigmoid(t_cls / T)  # same shape as t_cls
+                t_prob = torch.sigmoid(t_cls / T)  
                 B = t_prob.shape[0]
-                flat = t_prob.reshape(B, -1)       # [B, L]
+                flat = t_prob.reshape(B, -1)       
 
-                # per-image dynamic threshold
-                mean = flat.mean(dim=1, keepdim=True)                     # [B,1]
-                std  = flat.std(dim=1, unbiased=False, keepdim=True)      # [B,1]
-                thr  = torch.maximum(mean + lam * std,
-                                    flat.new_full((B, 1), thr_floor))    # [B,1]
-
-                fg_mask = (flat > thr).reshape_as(t_prob)                 # bool mask, same shape
-                # ERD weight: p^gamma
+                mean = flat.mean(dim=1, keepdim=True)                     
+                std  = flat.std(dim=1, unbiased=False, keepdim=True)      
+                
+                # 1. 分类 Mask (相对宽松)
+                thr_cls = torch.maximum(mean + lam * std, flat.new_full((B, 1), thr_floor_cls))
+                fg_mask_cls = (flat > thr_cls).reshape_as(t_prob)
                 w_cls = (t_prob.clamp_min(1e-6) ** gamma_cls)
 
-            # =========================
-            # (1) CLS distill (ERD): BCEWithLogits in sigmoid-space
-            # =========================
-            if fg_mask.any():
-                # teacher prob as soft target
-                with torch.no_grad():
-                    t_target = t_prob  # already sigmoid(logit/T)
+                # 2. 回归 Mask (极其严格)
+                thr_reg = torch.maximum(mean + lam * std, flat.new_full((B, 1), thr_floor_reg))
+                fg_mask_reg = (flat > thr_reg).reshape_as(t_prob)
+                w_reg = (t_prob.clamp_min(1e-6) ** gamma_reg)
 
-                # BCEWithLogits: input logits, target in [0,1]
+            # =========================
+            # (1) CLS distill: 仅对 Teacher 认为是前景的地方蒸馏，避开新类冲突
+            # =========================
+            if fg_mask_cls.any():
+                with torch.no_grad():
+                    t_target = t_prob  
+
                 bce = F.binary_cross_entropy_with_logits(
                     s_cls / T, t_target, reduction='none'
                 )
-                num = (bce * w_cls * fg_mask.float()).sum()
-                den = (w_cls * fg_mask.float()).sum().clamp_min(1e-6)
+                num = (bce * w_cls * fg_mask_cls.float()).sum()
+                den = (w_cls * fg_mask_cls.float()).sum().clamp_min(1e-6)
                 loss_fg = (num / den) * (T * T)
             else:
                 loss_fg = s_cls.sum() * 0.0
@@ -259,30 +279,17 @@ class CatSegDetector(TwoStageDetector):
             loss_rpn_cls += loss_fg
 
             # =========================
-            # (2) REG distill (ERD): only on confident locations
+            # (2) REG distill: 仅对 Teacher 极其确信的高质量框蒸馏
             # =========================
-            with torch.no_grad():
-                # 复用同一个 t_prob 做 reg gating（也可以单独 thr_floor_reg）
-                # 这里仍按 ERD：mean+0.5std 与 floor(0.1)
-                flat = t_prob.reshape(t_prob.shape[0], -1)
-                mean = flat.mean(dim=1, keepdim=True)
-                std  = flat.std(dim=1, unbiased=False, keepdim=True)
-                thr_reg = torch.maximum(mean + 0.5 * std,
-                                        flat.new_full((t_prob.shape[0], 1), 0.10))
-                fg_mask_reg = (flat > thr_reg).reshape_as(t_prob)
-                reg_weight = (t_prob.clamp_min(1e-6) ** gamma_reg)
-
             if fg_mask_reg.any():
-                # s_reg/t_reg shape: [B, A*4, H, W]
                 B, A4, H, W = s_reg.shape
                 A = A4 // 4
 
-                s_reg_perm = s_reg.view(B, A, 4, H, W).permute(0, 1, 3, 4, 2)  # [B,A,H,W,4]
+                s_reg_perm = s_reg.view(B, A, 4, H, W).permute(0, 1, 3, 4, 2)  
                 t_reg_perm = t_reg.view(B, A, 4, H, W).permute(0, 1, 3, 4, 2)
 
-                # mask/weight expand to last dim
-                m = fg_mask_reg.unsqueeze(-1).expand_as(s_reg_perm)             # [B,A,H,W,4]
-                w = reg_weight.unsqueeze(-1).expand_as(s_reg_perm)              # [B,A,H,W,4]
+                m = fg_mask_reg.unsqueeze(-1).expand_as(s_reg_perm)             
+                w = w_reg.unsqueeze(-1).expand_as(s_reg_perm)              
 
                 s_pos = s_reg_perm[m]
                 t_pos = t_reg_perm[m]
@@ -417,34 +424,33 @@ class CatSegDetector(TwoStageDetector):
         else:
             x = fpn_inputs
 
-        x_old = None
-        cat_seg_logits_old = None
-        teacher_indices = None
-        teacher_rpn_outs = None
-        teacher_roi_head = None
-        teacher_results_bboxes = None
+        # x_old = None
+        # cat_seg_logits_old = None
+        # teacher_indices = None
+        # teacher_rpn_outs = None
+        # teacher_roi_head = None
 
         losses = dict()
 
-        if self.use_feature_routing and (self.old_model is not None):
-            with torch.no_grad():
-                res_feats_old = self.old_model.backbone(img)
-                cat_seg_logits_old = res_feats_old[-3]
-                teacher_indices = res_feats_old[-2]
-                teacher_text_all = self.old_model.backbone.text_features
-                fpn_inputs_old = res_feats_old[:-3]
-                x_old = self.old_model.neck(fpn_inputs_old) if self.old_model.with_neck else fpn_inputs_old
-                if self.old_model.with_rpn:
-                    teacher_rpn_outs = self.old_model.rpn_head(x_old)
-                teacher_roi_head = self.old_model.roi_head
+        # if self.use_feature_routing and (self.old_model is not None):
+        #     with torch.no_grad():
+        #         res_feats_old = self.old_model.backbone(img)
+        #         cat_seg_logits_old = res_feats_old[-3]
+        #         teacher_indices = res_feats_old[-2]
+        #         teacher_text_all = self.old_model.backbone.text_features
+        #         fpn_inputs_old = res_feats_old[:-3]
+        #         x_old = self.old_model.neck(fpn_inputs_old) if self.old_model.with_neck else fpn_inputs_old
+        #         if self.old_model.with_rpn:
+        #             teacher_rpn_outs = self.old_model.rpn_head(x_old)
+        #         teacher_roi_head = self.old_model.roi_head
 
                 # ! 新增 依据iou剔除rpn中的部分样本
-                if self.old_model.with_rpn:
-                    proposal_cfg = self.old_model.test_cfg.rpn
-                    t_proposals = self.old_model.rpn_head.get_bboxes(
-                        *teacher_rpn_outs, img_metas=img_metas, cfg=proposal_cfg)
-                else:
-                    t_proposals = proposals # 极少情况
+                # if self.old_model.with_rpn:
+                #     proposal_cfg = self.old_model.test_cfg.rpn
+                #     t_proposals = self.old_model.rpn_head.get_bboxes(
+                #         *teacher_rpn_outs, img_metas=img_metas, cfg=proposal_cfg)
+                # else:
+                #     t_proposals = proposals # 极少情况
 
                 # ! 修改
                 # t_roi_outs = self.old_model.roi_head.simple_test(
@@ -476,26 +482,26 @@ class CatSegDetector(TwoStageDetector):
                 #         teacher_results_bboxes.append(t_res)
 
                 # 1) 用 teacher 的 roi_head 直接得到 det_bboxes / det_labels（不走 bbox2result）
-                det_bboxes, det_labels = self.old_model.roi_head.simple_test_bboxes(
-                    x_old,
-                    img_metas,
-                    t_proposals,
-                    self.old_model.test_cfg.rcnn,
-                    cat_seg_feats=cat_seg_logits_old,
-                    topk_indices=teacher_indices,
-                    vlm_feat=res_feats_old[-1],
-                    rescale=False
-                )
-                # 2) 组装 old-only 的 teacher_results_bboxes（每张图一个 [Ni,5]）
-                teacher_results_bboxes = []
-                score_thr=0.3
-                for bboxes_i, labels_i in zip(det_bboxes, det_labels):
-                    if bboxes_i.numel() == 0:
-                        teacher_results_bboxes.append(bboxes_i.new_zeros((0, 5)))
-                        continue
+                # det_bboxes, det_labels = self.old_model.roi_head.simple_test_bboxes(
+                #     x_old,
+                #     img_metas,
+                #     t_proposals,
+                #     self.old_model.test_cfg.rcnn,
+                #     cat_seg_feats=cat_seg_logits_old,
+                #     topk_indices=teacher_indices,
+                #     vlm_feat=res_feats_old[-1],
+                #     rescale=False
+                # )
+                # # 2) 组装 old-only 的 teacher_results_bboxes（每张图一个 [Ni,5]）
+                # teacher_results_bboxes = []
+                # score_thr=0.3
+                # for bboxes_i, labels_i in zip(det_bboxes, det_labels):
+                #     if bboxes_i.numel() == 0:
+                #         teacher_results_bboxes.append(bboxes_i.new_zeros((0, 5)))
+                #         continue
 
-                    old_mask = (labels_i < self.old_end) & (bboxes_i[:, 4] > score_thr)
-                    teacher_results_bboxes.append(bboxes_i[old_mask])
+                #     old_mask = (labels_i < self.old_end) & (bboxes_i[:, 4] > score_thr)
+                #     teacher_results_bboxes.append(bboxes_i[old_mask])
 
             # ! === Aggregator Logits 蒸馏 ===
             # student_logits_on_old = self.backbone.forward_with_text(
@@ -522,14 +528,13 @@ class CatSegDetector(TwoStageDetector):
                                                                     None,
                                                                     gt_bboxes_ignore,
                                                                     proposal_cfg,
-                                                                    teacher_results=teacher_results_bboxes,
                                                                     **kwargs)
             losses.update(rpn_losses)
-            if teacher_rpn_outs is not None:
-                student_rpn_outs = self.rpn_head(x)
-                # 调用辅助函数计算蒸馏
-                loss_rpn_dist = self.compute_rpn_distillation_loss(student_rpn_outs, teacher_rpn_outs)
-                losses.update(loss_rpn_dist)
+            # if teacher_rpn_outs is not None:
+            #     student_rpn_outs = self.rpn_head(x)
+            #     # 调用辅助函数计算蒸馏
+            #     loss_rpn_dist = self.compute_rpn_distillation_loss(student_rpn_outs, teacher_rpn_outs)
+            #     losses.update(loss_rpn_dist)
         else:
             proposal_list = proposals
 
@@ -540,11 +545,11 @@ class CatSegDetector(TwoStageDetector):
                                                  topk_indices, 
 
                                                  # 新增传入teacher数据
-                                                 x_old=x_old,
-                                                 cat_seg_logits_old=cat_seg_logits_old,
-                                                 teacher_indices=teacher_indices,
-                                                 teacher_roi_head=teacher_roi_head,
-                                                 old_end=self.old_end,
+                                                #  x_old=x_old,
+                                                #  cat_seg_logits_old=cat_seg_logits_old,
+                                                #  teacher_indices=teacher_indices,
+                                                #  teacher_roi_head=teacher_roi_head,
+                                                #  old_end=self.old_end,
                                                  **kwargs)
         losses.update(roi_losses)
 

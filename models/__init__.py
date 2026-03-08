@@ -12,3 +12,7 @@ from .cat_seg_backbone import CATSegCLIPViT
 from .cat_seg_detector import CatSegDetector  # noqa
 from .simplefpn import SimpleFPN
 from .cat_seg_loss import SegOrthogonalLoss
+
+from .fvit_dist import FViTDist
+from .fvit_head_distill import FViTBBoxHeadDist, FViTRoIHeadDist
+from .cat_seg_roi_moe_head import CatSegMoEBBoxHead, CatSegMoERoIHead

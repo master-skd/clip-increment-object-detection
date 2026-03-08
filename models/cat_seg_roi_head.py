@@ -372,8 +372,6 @@ class CatSegMaskRoIHead(StandardRoIHead):
             #     old_mask = (topk_indices < old_end).view(B, -1, 1, 1, 1)
                 
             #     # === 核心逻辑 ===
-            #     # 旧类(Novel)强制用 Teacher -> 保证 AP 回到 20+
-            #     # 新类(Base)用 Student -> 保证学习新知识
             #     base = torch.where(old_mask, base_old, base_new)
             # else:
             base = base_new.expand(B, x_mask.size(1), C, H, W)
@@ -687,14 +685,20 @@ class CatSegMaskRoIHead(StandardRoIHead):
             mean = t_conf.mean()
             std = t_conf.std(unbiased=False)
             # dynamic_threshold = torch.max(mean + lam * std, t_conf.new_tensor(thr_floor))
-            dynamic_threshold = mean + lam * std
+            dynamic_threshold = torch.max(mean + lam * std, t_conf.new_tensor(0.20))
 
             valid_mask = (t_conf > dynamic_threshold)              # [N]
 
             # Elastic weights（沿用你原先的 power-law）
             gamma = 2.0
-            max_p = t_conf.max().clamp(min=1e-6)
-            distill_weight = (t_conf / max_p).pow(gamma) * valid_mask.float()  # [N]
+            max_p = t_conf.max()
+            # distill_weight = (t_conf / max_p).pow(gamma) * valid_mask.float()  # [N]
+            if max_p > 0.3:
+                # 只有当图里确实有比较确信的旧类时，才使用 ERD 的弹性放大
+                distill_weight = (t_conf / max_p).pow(gamma) * valid_mask.float()
+            else:
+                # 图里全是底噪，不准做除法放大！直接用原始概率压制权重
+                distill_weight = t_conf.pow(gamma) * valid_mask.float()
 
             # 没选到就返回 0（保持图）
             if distill_weight.sum() == 0:
@@ -717,36 +721,43 @@ class CatSegMaskRoIHead(StandardRoIHead):
         # 对 old 维度求 mean（更稳，不会因为 old 类数变化导致尺度漂）
         loss_cls_per = bce.mean(dim=1) * (T * T)     # [M]
         losses['loss_roi_dist_cls'] = (loss_cls_per * w).sum() / (w.sum() + 1e-6)
+        losses['loss_roi_dist_cls'] = losses['loss_roi_dist_cls'] * 0.1
 
         # ------ 3) BBox distillation: 仍然只对选中的 RoIs ------
         if s_bbox_pred is not None and t_bbox_pred is not None:
-            s_bbox = s_bbox_pred[valid_mask]
-            t_bbox = t_bbox_pred[valid_mask]
-
+            # 增加对回归的严格过滤：只有同时满足动态阈值 AND 置信度绝对值大于 0.45 的框，才蒸馏回归
             with torch.no_grad():
-                t_label_sel = t_label_old[valid_mask]  # [M]
+                valid_mask_reg = valid_mask & (t_conf > 0.45)
+            
+            w_reg = distill_weight[valid_mask_reg]
 
-            if w.sum() > 0:
-                M = s_bbox.shape[0]
-                idx = torch.arange(M, device=s_bbox.device)
+            # 只有当存在符合严格要求的高质量框时，才计算回归损失
+            if w_reg.sum() > 0:
+                s_bbox = s_bbox_pred[valid_mask_reg]
+                t_bbox = t_bbox_pred[valid_mask_reg]
+
+                with torch.no_grad():
+                    t_label_sel = t_label_old[valid_mask_reg]  # [M_reg]
+
+                M_reg = s_bbox.shape[0]
+                idx = torch.arange(M_reg, device=s_bbox.device)
 
                 # Student alignment
                 if s_bbox.shape[1] > 4:
-                    s_target = s_bbox.view(M, -1, 4)[idx, t_label_sel]
+                    s_target = s_bbox.view(M_reg, -1, 4)[idx, t_label_sel]
                 else:
                     s_target = s_bbox
 
                 # Teacher alignment
                 if t_bbox.shape[1] > 4:
-                    t_target = t_bbox.view(M, -1, 4)[idx, t_label_sel]
+                    t_target = t_bbox.view(M_reg, -1, 4)[idx, t_label_sel]
                 else:
                     t_target = t_bbox
 
-                loss_bbox_per = F.smooth_l1_loss(s_target, t_target, reduction='none').sum(dim=1)  # [M]
-                losses['loss_roi_dist_bbox'] = (loss_bbox_per * w).sum() / (w.sum() + 1e-6)
+                loss_bbox_per = F.smooth_l1_loss(s_target, t_target, reduction='none').sum(dim=1)  # [M_reg]
+                losses['loss_roi_dist_bbox'] = (loss_bbox_per * w_reg).sum() / (w_reg.sum() + 1e-6)
             else:
                 losses['loss_roi_dist_bbox'] = s_bbox_pred.sum() * 0.0
-
         return losses
 
 
