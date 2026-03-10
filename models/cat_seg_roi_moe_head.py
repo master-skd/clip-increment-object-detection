@@ -48,7 +48,7 @@ class CatSegMoERoIHead(StandardRoIHead):
                       gt_bboxes_ignore=None,
                       gt_masks=None,
                       cat_seg_feats=None,
-                      topk_indices=None,
+                    #   topk_indices=None,
 
                     #   x_old=None,
                     #   cat_seg_logits_old=None,
@@ -76,7 +76,7 @@ class CatSegMoERoIHead(StandardRoIHead):
 
         rois = bbox2roi([res.bboxes for res in sampling_results])
 
-        bbox_results = self._bbox_forward(x, rois, cat_seg_feats=cat_seg_feats, topk_indices=topk_indices)
+        bbox_results = self._bbox_forward(x, rois, cat_seg_feats=cat_seg_feats)
         bbox_targets = self.bbox_head.get_targets(
             sampling_results, gt_bboxes, gt_labels, self.train_cfg)
 
@@ -119,7 +119,7 @@ class CatSegMoERoIHead(StandardRoIHead):
     #     )
     #     return bbox_results
 
-    def _bbox_forward(self, x, rois, cat_seg_feats, topk_indices=None, vlm_feat=None):
+    def _bbox_forward(self, x, rois, cat_seg_feats, vlm_feat=None):
         """
         核心改造：先分别做 RoIAlign，再在 RoI 级别进行特征乘法分解。
         """
@@ -183,15 +183,17 @@ class CatSegMoERoIHead(StandardRoIHead):
             vlm_roi_feats = self.vlm_roi_extractor([vlm_feat], rois)[..., 0, 0]
 
         # 将 Image 级别的 topk_indices 映射为 Proposal 级别的
-        if topk_indices is not None:
-            batch_inds = rois[:, 0].long()
-            proposal_topk_indices = topk_indices[batch_inds] # shape: [N, K]
-        else:
-            proposal_topk_indices = None
+        # if topk_indices is not None:
+        #     batch_inds = rois[:, 0].long()
+        #     proposal_topk_indices = topk_indices[batch_inds] # shape: [N, K]
+        # else:
+        #     proposal_topk_indices = None
 
         # 送入修改过参数量优化的 CatSegMoEBBoxHead
         cls_score, bbox_pred = self.bbox_head(
-            fused_bbox_feats, vlm_roi_feats, proposal_topk_indices
+            fused_bbox_feats, 
+            bbox_feats,
+            vlm_roi_feats
         )
         
         bbox_results = dict(
@@ -199,11 +201,11 @@ class CatSegMoERoIHead(StandardRoIHead):
         )
         return bbox_results
 
-    def simple_test(self, x, proposal_list, img_metas, cat_seg_feats=None, topk_indices=None, vlm_feat=None, rescale=False):
+    def simple_test(self, x, proposal_list, img_metas, cat_seg_feats=None, vlm_feat=None, rescale=False):
         assert self.with_bbox, "Bbox head must be implemented."
         det_bboxes, det_labels = self.simple_test_bboxes(
             x, img_metas, proposal_list, self.test_cfg,
-            cat_seg_feats=cat_seg_feats, topk_indices=topk_indices, rescale=rescale, vlm_feat=vlm_feat)
+            cat_seg_feats=cat_seg_feats, rescale=rescale, vlm_feat=vlm_feat)
         
         bbox_results = [
             bbox2result(det_bboxes[i], det_labels[i], self.bbox_head.num_classes)
@@ -223,7 +225,6 @@ class CatSegMoERoIHead(StandardRoIHead):
                            proposals,
                            rcnn_test_cfg,
                            cat_seg_feats=None,
-                           topk_indices=None,
                            vlm_feat=None,
                            rescale=False):
         """Test only det bboxes without augmentation."""
@@ -239,7 +240,7 @@ class CatSegMoERoIHead(StandardRoIHead):
             # There is no proposal in the whole batch
             return [det_bbox] * batch_size, [det_label] * batch_size
 
-        bbox_results = self._bbox_forward(x, rois, cat_seg_feats=cat_seg_feats, topk_indices=topk_indices, vlm_feat=vlm_feat)
+        bbox_results = self._bbox_forward(x, rois, cat_seg_feats=cat_seg_feats, vlm_feat=vlm_feat)
         img_shapes = tuple(meta['img_shape'] for meta in img_metas)
         scale_factors = tuple(meta['scale_factor'] for meta in img_metas)
 
@@ -299,7 +300,8 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
                  beta=0.45,
                  
                  old_end=None,
-                 topk=None,
+                 current_classes=None,
+                #  topk=None,
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -337,14 +339,14 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
         class_embed = torch.load(class_embed)
         all_embed = [class_embed[name] for name in self.all_classes]
         all_embed = torch.stack(all_embed, dim=0).permute(1, 0).contiguous()
-        all_embed = F.normalize(all_embed, p=2, dim=-1)
+        all_embed = F.normalize(all_embed, p=2, dim=0)
         self.register_buffer('all_embeddings', all_embed)
 
         if learn_bg:
             self.bg_embedding = nn.Parameter(all_embed[:, -1:].clone().contiguous())
 
         self.old_end = old_end
-        self.topk = topk
+        # self.topk = topk
         
         # =========================================================
         # 核心改造：放弃原有的巨大 FC，构建针对每个类别的“微型专家”
@@ -353,14 +355,15 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
         # 原来是 [N, 256, 7, 7] 展平，现在因为你送进来的是拆分好的 Top-K 单类特征，
         # 所以维度依然是 256 * 7 * 7 (假设 FPN 输出是 256 维)
         self.avg_pool_cls = nn.AdaptiveAvgPool2d((1, 1))
-        feat_dim = int(self.in_channels / self.topk)
+        feat_dim = self.in_channels
         hidden_dim = 128 # 专家内部隐藏层维度，可调
         
         self.class_experts = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(feat_dim, hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, text_dim) # 投影到 Text Embedding 所在的语义空间！
+                # nn.Linear(feat_dim, hidden_dim),
+                # nn.LayerNorm(hidden_dim),
+                # nn.ReLU(inplace=True),
+                nn.Linear(feat_dim, text_dim) # 投影到 Text Embedding 所在的语义空间！
             ) for _ in range(self.num_classes)
         ])
         
@@ -370,11 +373,11 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
                 for p in self.class_experts[i].parameters():
                     p.requires_grad = False
 
-        self.bg_expert = nn.Sequential(
-            nn.Linear(feat_dim, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, text_dim)
-        )
+        # self.bg_expert = nn.Sequential(
+        #     nn.Linear(feat_dim, 128),
+        #     nn.ReLU(inplace=True),
+        #     nn.Linear(128, text_dim)
+        # )
 
     @property
     def all_embed(self):
@@ -384,7 +387,7 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
         else:
             return self.all_embeddings
 
-    def forward(self, x, vlm_box_feats=None, topk_indices=None):
+    def forward(self, x, fpn_feats, vlm_box_feats=None):
         all_embed = self.all_embed.type_as(x)
 
         if vlm_box_feats is not None:
@@ -392,75 +395,55 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
             normalized_vlm_box_feats = F.normalize(vlm_box_feats, dim=-1, p=2)
         else:
             normalized_vlm_box_feats = None
+        
+        if self.training and self.old_end is not None and self.old_end > 0:
+            # Task 2 训练阶段：只激活新类
+            active_classes = list(range(self.old_end, self.num_classes))
+        else:
+            # 测试阶段 (或 Task 1 训练)：激活所有类
+            active_classes = list(range(self.num_classes))
+
         # x 的维度目前是：[N, K * 256, 7, 7] (因为你在 RoIHead 里 rearrange 了)
         N = x.shape[0]
-        K = self.topk
-        C = x.shape[1] // K  # C 就是 256
+        num_active = len(active_classes)
+        C = x.shape[1] // num_active  # C 就是 256
         H, W = x.shape[2], x.shape[3]
         
-        # 1. 解开 rearranged 的特征，恢复出 [N, K, 256, 7, 7]
-        # 然后展平最后三维得到 [N, K, 256*7*7]
-        x_unfolded = x.view(N, K, C, H, W).flatten(2) # shape: [N, K, feat_dim]
+        # ==========================================
+        # ⚠️ 请严格用下面这两行替换你旧的 flatten 代码！
+        # ==========================================
+        x_unfolded = x.view(N, num_active, C, H, W)
         
-        # 2. 初始化分类得分矩阵为极小值 (代表概率接近0)
-        # [N, num_classes]
-        x_pooled = self.avg_pool_cls(x_unfolded.view(N * K, C, H, W))
-        # 展平并变回 [N, K, 256]
-        x_cls_feat = x_pooled.view(N, K, C) 
+        # 先把 N 和 num_active 压平送进池化，池化完立刻 view 变回 3D 张量！
+        # 此时 x_pooled 的形状会变成极其干净的：[N, num_active, 256]
+        x_pooled = self.avg_pool_cls(x_unfolded.flatten(0, 1)).view(N, num_active, C)
+        # ==========================================
         
-        mean_feat = x_cls_feat.mean(dim=1) # shape: [N, 256]
+        cls_score = torch.full((N, self.num_classes), -10.0, device=x.device, dtype=x.dtype)
         
-        # 送入 bg_expert 得到投影，并做归一化
-        bg_projected = self.bg_expert(mean_feat) # [N, text_dim]
-        bg_norm = F.normalize(bg_projected, p=2, dim=-1, eps=1e-6)
-        
-        # 算出一个涵盖所有 num_classes 的底分矩阵
-        # 这个操作保证了所有类别的计算图都是连通的，永远不会发生梯度断裂！
-        base_score = (bg_norm @ all_embed) * self.logit_scale # [N, num_classes]
-        
-        # 使用 clone() 是为了防止后面的原地索引赋值导致 PyTorch 反向传播报错
-        cls_score = base_score.clone()
-        
-        # 3. 动态路由打分 (GPU 并行优化版)
-        if topk_indices is not None:
-            # 找到当前 Batch 中所有被激活的独特类别
-            unique_classes = torch.unique(topk_indices)
+        # 专属专家精准打分
+        for i, cls_id in enumerate(active_classes):
+            if cls_id >= self.num_classes:
+                continue
             
-            for cls_id in unique_classes:
-                if cls_id >= self.num_classes:
-                    continue
-                    
-                # 找到 [N, K] 中所有等于当前 cls_id 的位置掩码
-                mask = (topk_indices == cls_id) # shape: [N, K], bool
-                
-                # 提取出属于该类别的所有特征，实现 Batch 化处理
-                # feats 维度: [M, feat_dim]，其中 M 是当前 Batch 中预测为该类的总数
-                feats = x_cls_feat[mask] 
-                
-                # 1. 专家提取 (一次性处理 M 个特征，充分利用 GPU 并行)
-                projected_feat = self.class_experts[cls_id](feats) # [M, text_dim]
-                
-                # 2. L2 归一化
-                projected_feat_norm = F.normalize(projected_feat, p=2, dim=-1, eps=1e-6)
-                
-                # 3. 提取对应的 Text Embedding 并算相似度
-                target_text_embed = all_embed[:, cls_id] # [text_dim]
-                score = (projected_feat_norm @ target_text_embed) * self.logit_scale # [M]
-                
-                # 4. 将得分填回 cls_score 的对应位置
-                # 获取 mask 为 True 的第一维度索引 (即 N 维度上的索引 i)
-                batch_indices = mask.nonzero(as_tuple=True)[0] 
-                cls_score[batch_indices, cls_id] = score
-        else:
-            # 万一没有 topk_indices (比如某些初始化检查)，为了防报错
-            pass
+            # 因为 x_pooled 是 [N, num_active, 256]
+            # 这里的切片就能完美取出 [N, 256] 的正确特征块！
+            cls_feats = x_pooled[:, i, :] 
+            
+            projected_feat = self.class_experts[cls_id](cls_feats) # [N, 256] @ [256, 128] 完美契合！
+            projected_feat_norm = F.normalize(projected_feat, p=2, dim=-1, eps=1e-6)
+            
+            # 取出文本 Embedding 算余弦相似度
+            target_text_embed = all_embed[:, cls_id] # [text_dim]
+            score = (projected_feat_norm @ target_text_embed) * self.logit_scale # [N]
+            
+            # 填入矩阵对应的位置
+            cls_score[:, cls_id] = score
 
         # ---------------------------------------------------
         # 回归分支 (Reg Branch) - 简化处理
         # ---------------------------------------------------
-        # 由于输入是 K 个类的融合特征，我们可以把它们简单平均，或者用一个小的注意力池化，
-        # 然后送进原有的回归分支。这里用平均操作，把 [N, K*256, 7, 7] 压缩回 [N, 256, 7, 7]
-        x_reg = x  
+        x_reg = fpn_feats
         
         # 正常经过父类帮你建好的 2560 -> 256 的卷积层
         if self.num_shared_convs > 0:

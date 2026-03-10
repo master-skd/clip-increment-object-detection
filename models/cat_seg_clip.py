@@ -578,8 +578,8 @@ class Aggregator(nn.Module):
         attention_type='linear',
         prompt_channel=1,
         pad_len=256,
-        old_end=0,
-        k_old=0
+        # old_end=0,
+        # k_old=0
     ) -> None:
         """
         Cost Aggregation Model for CAT-Seg
@@ -642,8 +642,8 @@ class Aggregator(nn.Module):
 
         self.pad_len = pad_len
 
-        self.old_end = old_end
-        self.k_old = k_old
+        # self.old_end = old_end
+        # self.k_old = k_old
 
     def feature_map(self, img_feats, text_feats):
         # concatenated feature volume for feature aggregation baselines
@@ -690,7 +690,7 @@ class Aggregator(nn.Module):
         corr_embed = rearrange(corr_embed, '(B T) () H W -> B T H W', B=B)
         return corr_embed
     
-    def forward(self, img_feats, text_feats, appearance_guidance, force_indices=None):
+    def forward(self, img_feats, text_feats, appearance_guidance):
         """
         Arguments:
             img_feats: (B, C, H, W)
@@ -702,64 +702,75 @@ class Aggregator(nn.Module):
 
         corr = self.correlation(img_feats, text_feats) # shape = [B, P, T, H, W]
 
-        # !=== 新增: 强制对齐逻辑 ===
-        if force_indices is not None:
-            classes = force_indices
-            th_text = F.normalize(text_feats, dim=-1)
-            gather_index = classes[..., None, None].expand(-1, -1, th_text.size(-2), th_text.size(-1))
-            th_text = torch.gather(th_text, dim=1, index=gather_index)
-            img_feats = F.normalize(img_feats, dim=1)
-            corr = torch.einsum('bchw, bkpc -> bpkhw', img_feats, th_text)
-            topk_indices = classes
-            text_feats = th_text
+        # # !=== 新增: 强制对齐逻辑 ===
+        # if force_indices is not None:
+        #     classes = force_indices
+        #     th_text = F.normalize(text_feats, dim=-1)
+        #     gather_index = classes[..., None, None].expand(-1, -1, th_text.size(-2), th_text.size(-1))
+        #     th_text = torch.gather(th_text, dim=1, index=gather_index)
+        #     img_feats = F.normalize(img_feats, dim=1)
+        #     corr = torch.einsum('bchw, bkpc -> bpkhw', img_feats, th_text)
+        #     topk_indices = classes
+        #     text_feats = th_text
 
-        elif self.pad_len > 0 and text_feats.size(1) > self.pad_len:
-            K = self.pad_len
-            old_end = getattr(self, 'old_end', 19)  # 0-18 old, 19-... new
-            # 建议 pad_len=8 时 old 保底 2 个
-            k_old = getattr(self, 'k_old', 4)
-            k_old = min(k_old, old_end, K)
-            k_new = K - k_old
+        # elif self.pad_len > 0 and text_feats.size(1) > self.pad_len:
+        #     K = self.pad_len
+        #     old_end = getattr(self, 'old_end', 19)  # 0-18 old, 19-... new
+        #     # 建议 pad_len=8 时 old 保底 2 个
+        #     k_old = getattr(self, 'k_old', 4)
+        #     k_old = min(k_old, old_end, K)
+        #     k_new = K - k_old
 
-            # ------- (A) 更稳健的 class score：先 spatial max，再 prompt mean -------
-            # corr: [B,P,T,H,W] -> spatial max: [B,P,T] -> mean over P: [B,T]
-            score = corr.amax(dim=(-1, -2)).mean(dim=1)  # [B,T]
+        #     # ------- (A) 更稳健的 class score：先 spatial max，再 prompt mean -------
+        #     # corr: [B,P,T,H,W] -> spatial max: [B,P,T] -> mean over P: [B,T]
+        #     score = corr.amax(dim=(-1, -2)).mean(dim=1)  # [B,T]
 
-            # ------- (B) 配额 TopK：old + new -------
-            score_old = score[:, :old_end]          # [B,old_end]
-            score_new = score[:, old_end:]          # [B,T-old_end]
+        #     # ------- (B) 配额 TopK：old + new -------
+        #     score_old = score[:, :old_end]          # [B,old_end]
+        #     score_new = score[:, old_end:]          # [B,T-old_end]
 
-            idx_old = score_old.topk(k_old, dim=-1, largest=True, sorted=False).indices  # [B,k_old]
+        #     idx_old = score_old.topk(k_old, dim=-1, largest=True, sorted=False).indices  # [B,k_old]
 
-            if k_new > 0 and score_new.numel() > 0:
-                idx_new = score_new.topk(min(k_new, score_new.size(1)), dim=-1, largest=True, sorted=False).indices + old_end
-            else:
-                idx_new = idx_old.new_zeros((idx_old.size(0), 0))
+        #     if k_new > 0 and score_new.numel() > 0:
+        #         idx_new = score_new.topk(min(k_new, score_new.size(1)), dim=-1, largest=True, sorted=False).indices + old_end
+        #     else:
+        #         idx_new = idx_old.new_zeros((idx_old.size(0), 0))
 
-            classes = torch.cat([idx_old, idx_new], dim=-1)  # [B,K]（通常就是8）
-            # 可选：防御性去重+补齐（一般不会重复，但留着更稳）
-            # classes = torch.unique(classes, dim=-1)
-            if classes.size(1) < K:
-                mask = torch.ones_like(score, dtype=torch.bool)
-                mask.scatter_(1, classes, False)
-                fill = score.masked_fill(~mask, -1e9).topk(K - classes.size(1), dim=-1).indices
-                classes = torch.cat([classes, fill], dim=-1)
+        #     classes = torch.cat([idx_old, idx_new], dim=-1)  # [B,K]（通常就是8）
+        #     # 可选：防御性去重+补齐（一般不会重复，但留着更稳）
+        #     # classes = torch.unique(classes, dim=-1)
+        #     if classes.size(1) < K:
+        #         mask = torch.ones_like(score, dtype=torch.bool)
+        #         mask.scatter_(1, classes, False)
+        #         fill = score.masked_fill(~mask, -1e9).topk(K - classes.size(1), dim=-1).indices
+        #         classes = torch.cat([classes, fill], dim=-1)
 
-            # ------- (C) gather text feats -------
-            th_text = F.normalize(text_feats, dim=-1)  # [B,T,P,C]
-            th_text = torch.gather(
-                th_text, dim=1,
-                index=classes[..., None, None].expand(-1, -1, th_text.size(-2), th_text.size(-1))
-            )  # [B,K,P,C]
+        #     # ------- (C) gather text feats -------
+        #     th_text = F.normalize(text_feats, dim=-1)  # [B,T,P,C]
+        #     th_text = torch.gather(
+        #         th_text, dim=1,
+        #         index=classes[..., None, None].expand(-1, -1, th_text.size(-2), th_text.size(-1))
+        #     )  # [B,K,P,C]
 
-            # 重新算 corr（注意这里 th_text 的第二维变成 K，所以 einsum 的符号要对应）
-            img_feats = F.normalize(img_feats, dim=1)
-            text_feats = th_text
-            corr = torch.einsum('bchw, bkpc -> bpkhw', img_feats, th_text)  # [B,P,K,H,W]
+        #     # 重新算 corr（注意这里 th_text 的第二维变成 K，所以 einsum 的符号要对应）
+        #     img_feats = F.normalize(img_feats, dim=1)
+        #     text_feats = th_text
+        #     corr = torch.einsum('bchw, bkpc -> bpkhw', img_feats, th_text)  # [B,P,K,H,W]
 
-            # 如果你后面还需要 classes/topk_indices，直接 return / cache
-            topk_indices = classes  # [B,K]
+        #     # 如果你后面还需要 classes/topk_indices，直接 return / cache
+        #     topk_indices = classes  # [B,K]
         # corr = self.feature_map(img_feats, text_feats)
+
+        if self.pad_len > 0 and text_feats.size(1) > self.pad_len:
+            avg = corr.permute(0, 2, 1, 3, 4).flatten(-3).max(dim=-1)[0] 
+            classes = avg.topk(self.pad_len, dim=-1, sorted=False)[1]
+            th_text = F.normalize(text_feats, dim=-1)
+            th_text = torch.gather(th_text, dim=1, index=classes[..., None, None].expand(-1, -1, th_text.size(-2), th_text.size(-1)))
+            orig_clases = text_feats.size(1)
+            img_feats = F.normalize(img_feats, dim=1) # B C H W
+            text_feats = th_text
+            corr = torch.einsum('bchw, btpc -> bpthw', img_feats, th_text)
+        #corr = self.feature_map(img_feats, text_feats)
         corr_embed = self.corr_embed(corr) # shape = [B, T, hidden_dim, H, W]
         # return corr_embed
 
@@ -788,7 +799,7 @@ class Aggregator(nn.Module):
         #                 index=classes[..., None, None, None].expand(-1, -1, logit.size(2), logit.size(3), logit.size(4)), 
         #                 src=logit)
         #     logit = out
-        return logit, topk_indices
+        return logit
 
 
 class PromptOrder:
@@ -924,9 +935,9 @@ class CatSegEvaCLIPViT(BaseModule):
         attention_type,                # 注意力类型
         out_indices,                   # appearance guidance 索引
         cat_seg_indices,
-        pad_len,
-        old_end,
-        k_old,
+        # pad_len,
+        # old_end,
+        # k_old,
         norm_cfg,                      # 归一化配置
         **kwargs                       # ⭐ 接受额外参数（包括with_cp）
     ):
@@ -949,7 +960,7 @@ class CatSegEvaCLIPViT(BaseModule):
         self.clip_model.float()
 
         # text level
-        class_names = json.load(open(class_names, 'r')) + ['background']
+        class_names = json.load(open(class_names, 'r'))
         text_promtps = PromptOrder().prompt(class_names)
         self.text_features = self.encode_text(text_promtps)
         
@@ -979,9 +990,9 @@ class CatSegEvaCLIPViT(BaseModule):
             window_size=window_size,
             attention_type=attention_type,
             prompt_channel=prompt_channel,  # 传入实际的 prompt 数量
-            pad_len=pad_len,
-            old_end=old_end,
-            k_old=k_old
+            # pad_len=pad_len,
+            # old_end=old_end,
+            # k_old=k_old
         )
 
         self.proj_dim = self.clip_model.visual.embed_dim
@@ -1086,7 +1097,7 @@ class CatSegEvaCLIPViT(BaseModule):
         res4 = self.upsample1(res4)
         res5 = self.upsample2(res5)
         # [bsz, class_num, c, h, w]
-        logits, topk_indices = self.seg_decoder(img_feats, text_feats, appearance_guidance=[res3, res4, res5])
+        logits = self.seg_decoder(img_feats, text_feats, appearance_guidance=[res3, res4, res5])
         # feats = rearrange(feats, "B T C H W -> B (T C) H W")
 
         
@@ -1094,7 +1105,7 @@ class CatSegEvaCLIPViT(BaseModule):
             interpolate = getattr(self, f"interpolate{idx + 1}")
             outs[idx] = interpolate(out.detach())
         outs.append(logits)
-        outs.append(topk_indices)
+        # outs.append(topk_indices)
         outs.append(img_feats) if not self.training else outs.append(None)
         return outs  # 4个多尺度特征 + 最终logits
     

@@ -1,21 +1,32 @@
 find_unused_parameters = True
 norm_cfg = dict(type='SyncBN', requires_grad=True)
 num_classes=40
-select_classes=10
+current_classes=21
+# select_classes=10
 class_weight = [
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 
     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
 ]
+
+history_tasks = [
+    dict(
+        config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask.py',
+        weight_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_15.pth' # ⭐ 填入你 Task 1 跑出来的权重绝对路径
+    )
+]
+
 model = dict(
     type='CatSegDetector',
-
+    history_tasks=history_tasks,
+    anchor_weight=1e-5,
+    anchor_from_history_idx=-1,
     backbone=dict(
         type='CatSegEvaCLIPViT',
         model_name='EVA02-CLIP-B-16',
         pretrained=None,
-        class_names='datasets/incremental_classes/task12_classes.json',
+        class_names='datasets/incremental_classes/task2_classes.json',
         text_guidance_dim=512,
         text_guidance_proj_dim=128,
         appearance_guidance_dim=512,
@@ -32,9 +43,9 @@ model = dict(
         attention_type='linear',
         out_indices=[3, 5, 7, 11],  # 输出中间层特征
         cat_seg_indices=[3, 7],
-        pad_len=select_classes,
-        old_end=19,
-        k_old=5,
+        # pad_len=select_classes,
+        # old_end=19,
+        # k_old=5,
         norm_cfg=norm_cfg,
     ),
     neck=dict(
@@ -77,7 +88,8 @@ model = dict(
         ),
         bbox_head=dict(
             type='CatSegMoEBBoxHead',
-            in_channels=256*(select_classes),
+            # current_classes=current_classes,
+            in_channels=256,
             fc_out_channels=512,
             roi_feat_size=7,
             text_dim=512,
@@ -92,7 +104,7 @@ model = dict(
             beta=0.8,
             
             old_end=19,
-            topk=select_classes,
+            # topk=select_classes,
             class_embed='datasets/embeddings/coco_with_background_evaclip_vitb_16.pt',
             seen_classes='datasets/incremental_classes/task2_classes.json',
             all_classes='datasets/incremental_classes/task12_classes.json',
@@ -102,7 +114,7 @@ model = dict(
                 target_stds=[0.1, 0.1, 0.2, 0.2],
             ),
             # loss_cls=dict(
-            #     type='BCEWithLogitsLoss', loss_weight=1.0
+            #     type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0
             # ), 
             loss_cls=dict(
                 type='CustomCrossEntropyLoss',
@@ -199,7 +211,7 @@ checkpoint_config = dict(interval=1)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-load_from = 'runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_3.pth'
+load_from = 'runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_15.pth'
 resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0
@@ -263,30 +275,30 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=16,
+    samples_per_gpu=8,
     workers_per_gpu=8,
     train=dict(
         type=dataset_type,
         ann_file=
-        '/mnt/data14/yyg/datasets/Incremental/train_task_2.json',
-        # ann_file='/mnt/data14/yyg/F-ViT/train_task2_with_pseudo_labels_2d.json',
-        img_prefix='/mnt/data14/yyg/datasets/MSCOCO/2017/train2017',
+        '/hy-tmp/datasets/Incremental/train_task_2.json',
+        # ann_file='/hy-tmp/F-ViT/train_task2_with_pseudo_labels_2d.json',
+        img_prefix='/hy-tmp/datasets/MSCOCO/2017/train2017',
         seen_classes='datasets/incremental_classes/task2_classes.json',
         all_classes='datasets/incremental_classes/task12_classes.json',
         unseen_classes='datasets/incremental_classes/task1_classes.json',
         pipeline=train_pipeline),
     val=dict(
         type=dataset_type,
-        ann_file='/mnt/data14/yyg/datasets/Incremental/test_task_12.json',
-        img_prefix='/mnt/data14/yyg/datasets/MSCOCO/2017/val2017',
+        ann_file='/hy-tmp/datasets/Incremental/test_task_12.json',
+        img_prefix='/hy-tmp/datasets/MSCOCO/2017/val2017',
         seen_classes='datasets/incremental_classes/task2_classes.json',
         all_classes='datasets/incremental_classes/task12_classes.json',
         unseen_classes='datasets/incremental_classes/task1_classes.json',
         pipeline=test_pipeline),
     test=dict(
         type=dataset_type,
-        ann_file='/mnt/data14/yyg/datasets/Incremental/test_task_12.json',
-        img_prefix='/mnt/data14/yyg/datasets/MSCOCO/2017/val2017', 
+        ann_file='/hy-tmp/datasets/Incremental/test_task_12.json',
+        img_prefix='/hy-tmp/datasets/MSCOCO/2017/val2017', 
         seen_classes='datasets/incremental_classes/task2_classes.json',
         all_classes='datasets/incremental_classes/task12_classes.json',
         unseen_classes='datasets/incremental_classes/task1_classes.json',
@@ -304,9 +316,9 @@ lr_config = dict(
     min_lr=1e-7,
 
     warmup='linear',
-    # warmup_iters=10482,  # 2张卡
+    warmup_iters=20958,  # 2张卡
     # warmup_iters=3498,  # 6张卡
-    warmup_iters=5244,
+    # warmup_iters=5244,
     warmup_ratio=0.001,
     )
 runner = dict(type='EpochBasedRunner', max_epochs=30)

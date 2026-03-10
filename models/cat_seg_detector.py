@@ -2,11 +2,13 @@ from mmdet.models.builder import DETECTORS
 from mmdet.models.detectors import TwoStageDetector
 import torch.nn.functional as F
 import torch
+from torch import nn
 from mmdet.core.bbox.iou_calculators import bbox_overlaps
 
 from mmcv import Config
 from mmcv.runner import load_checkpoint
 from mmdet.models import build_detector
+from mmdet.models.builder import build_backbone
 
 from .cat_seg_loss import SegOrthogonalLoss  # 直接导入类
 
@@ -19,8 +21,12 @@ class CatSegDetector(TwoStageDetector):
                  roi_head,
                  train_cfg,
                  test_cfg,
+                 history_tasks=None,
                  pretrained=None,
                  init_cfg=None,
+
+                 anchor_weight=0.0,
+                 anchor_from_history_idx=-1
                 #  pseudo_iou_thr=0.5,
                 #  min_keep=512,
 
@@ -30,82 +36,110 @@ class CatSegDetector(TwoStageDetector):
                 #  old_end=0,
     ):
         super().__init__(backbone, neck, rpn_head, roi_head, train_cfg, test_cfg, pretrained, init_cfg)
-        # self.pseudo_iou_thr = pseudo_iou_thr
-        # self.min_keep = min_keep
 
-        # self.use_feature_routing = use_feature_routing
-        # self.old_cfg = old_cfg
-        # self.old_ckpt = old_ckpt
-        # self.old_end = old_end
+        self.anchor_weight = anchor_weight
+        self.anchor_from_history_idx = anchor_from_history_idx
+        self.old_neck_params = {}
+        
+        self.history_backbones = nn.ModuleList()
+        if history_tasks is not None and len(history_tasks) > 0:
+            print(f"==> [CatSegDetector] Reading {len(history_tasks)} history configs...")
+            anchor_idx = anchor_from_history_idx % len(history_tasks)
+            for idx, task_info in enumerate(history_tasks):
+                old_cfg = Config.fromfile(task_info['config_path'])
+                old_model = build_detector(
+                    old_cfg.model,
+                    train_cfg=old_cfg.get('train_cfg'),
+                    test_cfg=old_cfg.get('test_cfg')
+                )
+                load_checkpoint(old_model, task_info['weight_path'], map_location='cpu', strict=False)
+                old_bb = old_model.backbone
+                old_bb.eval()
+                for param in old_bb.parameters():
+                    param.requires_grad = False
+                self.history_backbones.append(old_bb)
 
-        # self.old_model = None
-        # if self.use_feature_routing and (old_cfg is not None) and (old_ckpt is not None):
-        #     self.old_model = self._build_old_model(old_cfg, old_ckpt)
+                if self.anchor_weight > 0 and idx == anchor_idx:
+                    print(f"==> [CatSegDetector] Using history task {idx} for neck anchor")
+                    for name, p in old_model.neck.named_parameters():
+                        # 存成和当前模型 self.named_parameters() 一致的名字
+                        self.old_neck_params[f'neck.{name}'] = p.detach().clone().cpu()
 
+                    print("==> [CatSegDetector] Saved old neck params for anchor:")
+                    for k in self.old_neck_params.keys():
+                        print(f"   {k}")
+                # ============================================
+
+                del old_model
+            print("==> [CatSegDetector] History backbones loaded seamlessly via mmcv.load_checkpoint!")
 
         self.ortho_loss = SegOrthogonalLoss(loss_weight=0.5)
 
-        # 1. 冻结 FPN (Neck)
-        if self.with_neck:
-            for param in self.neck.parameters():
-                param.requires_grad = False
-                
-        # 2. 冻结 RPN (Region Proposal Network)
-        if self.with_rpn:
-            for param in self.rpn_head.parameters():
-                param.requires_grad = False
+    def compute_neck_anchor_loss(self):
+        if self.anchor_weight <= 0 or len(self.old_neck_params) == 0:
+            return None
 
-    def train(self, mode=True):
-        """Override train to keep frozen modules in eval mode."""
-        super().train(mode)
-        
-        if self.with_neck:
-            self.neck.eval()      # 强制 FPN 保持推理状态
-        if self.with_rpn:
-            self.rpn_head.eval()  # 强制 RPN 保持推理状态
+        loss_anchor = 0.0
+        count = 0
 
-    # def _build_old_model(self, cfg_path, ckpt_path):
-    #     cfg = Config.fromfile(cfg_path)
+        for name, p in self.named_parameters():
+            if not name.startswith('neck.'):
+                continue
+            if name not in self.old_neck_params:
+                continue
+            if not p.requires_grad:
+                continue
 
-    #     # 防止 old config 里也写了 old_cfg/old_ckpt 递归
-    #     if isinstance(cfg.model, dict):
-    #         for k in ['old_cfg', 'old_ckpt', 'use_feature_routing', 'old_end',
-    #                   'teacher_cfg', 'teacher_ckpt', 'teacher_score_thr', 'teacher_box_dilation']:
-    #             cfg.model.pop(k, None)
+            old_p = self.old_neck_params[name].to(device=p.device, dtype=p.dtype)
+            loss_anchor = loss_anchor + F.mse_loss(p, old_p, reduction='sum')
+            count += p.numel()
 
-    #     old_model = build_detector(cfg.model,
-    #                                train_cfg=cfg.get('train_cfg'),
-    #                                test_cfg=cfg.get('test_cfg'))
+        if count == 0:
+            return None
 
-    #     # 这里 strict=False，避免你之前那种 unexpected key
-    #     print("loading teacher")
-    #     load_checkpoint(old_model, ckpt_path, map_location='cpu', strict=False)
-    #     print("loading teacher done!")
-
-    #     old_model.eval()
-    #     for p in old_model.parameters():
-    #         p.requires_grad_(False)
-    #     return old_model
+        loss_anchor = loss_anchor / count
+        return self.anchor_weight * loss_anchor
 
     def simple_test(self, img, img_metas, proposals=None, rescale=False):
         assert self.with_bbox, 'Bbox head must be implemented.'
-        res_feats = self.backbone(img)
-        # cat_seg_feats = res_feats[-2]
-        cat_seg_logits = res_feats[-3]
-        topk_indices = res_feats[-2]
-        if self.with_neck:
-            x = self.neck(res_feats[:-3])
-        else:
-            x = res_feats[:-3]
-            
 
+        all_logits = []
+        if len(self.history_backbones) > 0:
+            with torch.no_grad():
+                for old_bb in self.history_backbones:
+                    old_bb.eval()
+                    old_res_feats = old_bb(img)
+                    old_logits = old_res_feats[-2] # 提取历史 Logits
+                    all_logits.append(old_logits)
+
+        res_feats = self.backbone(img)
+        # cat_seg_logits = res_feats[-2]
+        current_logits = res_feats[-2]
+
+        all_logits.append(current_logits)
+        cat_seg_logits = torch.cat(all_logits, dim=1)  # 在通道维度拼接 Logits
+        # topk_indices = res_feats[-2]
+
+        if self.with_neck:
+            x = self.neck(res_feats[:-2])
+        else:
+            x = res_feats[:-2]
+
+        spatial_attn, _ = torch.max(cat_seg_logits.sigmoid(), dim=1, keepdim=True)  # [B, 1, H, W]
+        spatial_attn = spatial_attn.detach()  # 不反向传播到 backbone
+        routed_x = []
+        for feat in x:
+            attn_resized = F.interpolate(spatial_attn, size=feat.shape[-2:], mode='bilinear', align_corners=False)
+            routed_feat = feat * (1.0 + attn_resized)
+            routed_x.append(routed_feat)
+        routed_x = tuple(routed_x)
+            
         if proposals is None:
-            proposal_list = self.rpn_head.simple_test_rpn(x, img_metas)
+            proposal_list = self.rpn_head.simple_test_rpn(routed_x, img_metas)
         else:
             proposal_list = proposals
 
-
-        res = self.roi_head.simple_test(x, proposal_list, img_metas, cat_seg_logits, topk_indices, 
+        res = self.roi_head.simple_test(x, proposal_list, img_metas, cat_seg_logits, 
                                         vlm_feat=res_feats[-1],
                                         rescale=rescale)
 
@@ -220,7 +254,6 @@ class CatSegDetector(TwoStageDetector):
             'loss_rpn_dist_reg': loss_rpn_reg / div
         }
 
-
     def compute_rpn_distillation_loss(self, student_outs, teacher_outs):
         s_cls_scores, s_bbox_preds = student_outs
         t_cls_scores, t_bbox_preds = teacher_outs
@@ -308,102 +341,6 @@ class CatSegDetector(TwoStageDetector):
             'loss_rpn_dist_reg': loss_rpn_reg / div,
         }
 
-    # def compute_rpn_distillation_loss(self, student_outs, teacher_outs):
-    #     """
-    #     修正版 RPN 蒸馏：不对称加权，防止抑制新类
-    #     """
-    #     s_cls_scores, s_bbox_preds = student_outs
-    #     t_cls_scores, t_bbox_preds = teacher_outs
-        
-    #     loss_rpn_cls = s_cls_scores[0].new_tensor(0.0)
-    #     loss_rpn_reg = s_cls_scores[0].new_tensor(0.0)
-        
-    #     valid_levels = 0
-        
-    #     for s_cls, s_reg, t_cls, t_reg in zip(s_cls_scores, s_bbox_preds, t_cls_scores, t_bbox_preds):
-    #         # 1. 概率计算
-    #         t_probs = t_cls.sigmoid()
-    #         s_probs = s_cls.sigmoid()
-            
-    #         # =================================================================
-    #         # Part 1: Objectness 蒸馏 (分类) - 核心修改 !!!
-    #         # =================================================================
-            
-    #         # 策略：只蒸馏 Teacher 确信的区域。
-    #         # 对于 Teacher 认为是背景的区域，给予极低的权重，允许 Student 学习新类。
-            
-    #         # 1. 基础权重设为极小值 (例如 0.05 或 0.1)
-    #         # 这样 Student 在 Teacher 认为是背景的地方可以自由学习 GT
-    #         obj_weight = torch.ones_like(t_probs) * 0.1 
-            
-    #         # 2. 只有 Teacher 确信是物体的地方 (prob > 0.5), 权重才设为高值 (例如 1.0 或 2.0)
-    #         # 这保护了旧类不被当成背景
-    #         teacher_fg_mask = t_probs > 0.5
-    #         obj_weight[teacher_fg_mask] = 2.0
-            
-    #         # 使用 L1 Loss
-    #         diff = F.l1_loss(s_probs, t_probs, reduction='none')
-            
-    #         # 计算 Loss，这里的系数可以适当降低，比如从 10.0 降到 2.0 或 5.0
-    #         # 避免蒸馏 Loss 即使在低权重下也过大
-    #         loss_rpn_cls += (diff * obj_weight).mean() * 5.0
-
-    #         # =================================================================
-    #         # Part 2: Regression 蒸馏 (保持 ERD 逻辑不变)
-    #         # =================================================================
-    #         with torch.no_grad():
-    #             batch_mean = t_probs.mean()
-    #             batch_std = t_probs.std()
-    #             dynamic_threshold = torch.max(
-    #                 batch_mean + 0.5 * batch_std, 
-    #                 t_probs.new_tensor(0.1) 
-    #             )
-    #             fg_mask = t_probs > dynamic_threshold
-    #             reg_weight = torch.pow(t_probs, 2.0)
-            
-    #         if fg_mask.sum() > 0:
-    #             B, A4, H, W = s_reg.shape
-    #             A = A4 // 4
-    #             s_reg_perm = s_reg.view(B, A, 4, H, W).permute(0, 1, 3, 4, 2)
-    #             t_reg_perm = t_reg.view(B, A, 4, H, W).permute(0, 1, 3, 4, 2)
-                
-    #             fg_mask_expanded = fg_mask.unsqueeze(-1).expand_as(s_reg_perm)
-    #             s_pos_reg = s_reg_perm[fg_mask_expanded]
-    #             t_pos_reg = t_reg_perm[fg_mask_expanded]
-                
-    #             reg_weight_expanded = reg_weight.unsqueeze(-1).expand_as(s_reg_perm)
-    #             weights_pos = reg_weight_expanded[fg_mask_expanded]
-
-    #             loss_per_loc = F.smooth_l1_loss(s_pos_reg, t_pos_reg, reduction='none')
-    #             loss_rpn_reg += (loss_per_loc * weights_pos).sum() / (weights_pos.sum() + 1e-6)
-
-    #         valid_levels += 1
-
-    #     div = valid_levels if valid_levels > 0 else 1.0
-    #     return {
-    #         'loss_rpn_dist_cls': loss_rpn_cls / div,
-    #         'loss_rpn_dist_reg': loss_rpn_reg / div
-    #     }
-
-    def compute_aggregator_distillation_loss(self, s_logits, t_logits):
-        # 1. 基础 MSE
-        loss_map = F.mse_loss(s_logits, t_logits, reduction='none')
-        
-        # 2. 激进策略：不要筛选，全图都要对齐！
-        # 即使是背景，Student 也要输出和 Teacher 一样的数值 (维持 Response Pattern)
-        # 这样能强迫 Aggregator 的参数不发生剧烈漂移
-        
-        # 为了保留 ERD 的一点思想，我们可以给高分区域加权，但绝不能让低分区域权重为 0
-        with torch.no_grad():
-            t_probs = t_logits.sigmoid()
-            # 基础权重 1.0 + 弹性权重 (让高分区域更重要，但背景也有 1.0 的约束)
-            weight = 1.0 + 5.0 * torch.pow(t_probs, 2.0)
-
-        loss_distill = (loss_map * weight).mean()
-        
-        # 3. 再次加大系数 (Map 蒸馏数值通常很小，需要 x100 甚至更多来抗衡主 Loss)
-        return {'loss_agg_dist': loss_distill * 100.0}
-
     def forward_train(self,
                       img,
                       img_metas,
@@ -414,10 +351,10 @@ class CatSegDetector(TwoStageDetector):
                       proposals=None,
                       **kwargs):
         res_feats = self.backbone(img)
-        cat_seg_logits = res_feats[-3]
-        topk_indices = res_feats[-2]
+        cat_seg_logits = res_feats[-2]
+        # topk_indices = res_feats[-2]
         # 4. 多尺度 CLIP 特征 (给 FPN 的原料)
-        fpn_inputs = res_feats[:-3]
+        fpn_inputs = res_feats[:-2]
 
         if self.with_neck:
             x = self.neck(fpn_inputs)
@@ -519,10 +456,19 @@ class CatSegDetector(TwoStageDetector):
         if cat_seg_logits is not None and cat_seg_logits.shape[1] > 1:
             losses['loss_catseg_ortho'] = self.ortho_loss(cat_seg_logits)
 
+        spatial_attn, _ = torch.max(cat_seg_logits.sigmoid(), dim=1, keepdim=True)  # [B, 1, H, W]
+        spatial_attn = spatial_attn.detach()  # 不反向传播到 backbone
+        routed_x = []
+        for feat in x:
+            attn_resized = F.interpolate(spatial_attn, size=feat.shape[-2:], mode='bilinear', align_corners=False)
+            routed_feat = feat * (1.0 + attn_resized)
+            routed_x.append(routed_feat)
+        routed_x = tuple(routed_x)
+
         if self.with_rpn:
             proposal_cfg = self.train_cfg.get('rpn_proposal', self.test_cfg.rpn)
             # 在原来的多尺度特征图上提取proposal
-            rpn_losses, proposal_list = self.rpn_head.forward_train(x,
+            rpn_losses, proposal_list = self.rpn_head.forward_train(routed_x,
                                                                     img_metas,
                                                                     gt_bboxes,
                                                                     None,
@@ -542,7 +488,7 @@ class CatSegDetector(TwoStageDetector):
                                                  gt_bboxes, gt_labels,
                                                  gt_bboxes_ignore, gt_masks,
                                                  cat_seg_logits, # 传入 Logits
-                                                 topk_indices, 
+                                                #  topk_indices, 
 
                                                  # 新增传入teacher数据
                                                 #  x_old=x_old,
@@ -552,5 +498,9 @@ class CatSegDetector(TwoStageDetector):
                                                 #  old_end=self.old_end,
                                                  **kwargs)
         losses.update(roi_losses)
+
+        loss_neck_anchor = self.compute_neck_anchor_loss()
+        if loss_neck_anchor is not None:
+            losses['loss_neck_anchor'] = loss_neck_anchor
 
         return losses
