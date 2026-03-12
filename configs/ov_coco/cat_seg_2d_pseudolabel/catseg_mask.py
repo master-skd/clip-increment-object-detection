@@ -254,29 +254,29 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=8,
+    samples_per_gpu=16,
     workers_per_gpu=8,
     train=dict(
         type=dataset_type,
         ann_file=
-        '/hy-tmp/datasets/Incremental/train_task_1.json',
-        img_prefix='/hy-tmp/datasets/MSCOCO/2017/train2017',
+        '/mnt/data14/yyg/datasets/Incremental/train_task_1.json',
+        img_prefix='/mnt/data14/yyg/datasets/MSCOCO/2017/train2017',
         seen_classes='datasets/incremental_classes/task1_classes.json',
         all_classes='datasets/incremental_classes/task1_classes.json',
         unseen_classes='datasets/incremental_classes/task0_classes.json',
         pipeline=train_pipeline),
     val=dict(
         type=dataset_type,
-        ann_file='/hy-tmp/datasets/Incremental/test_task_1.json',
-        img_prefix='/hy-tmp/datasets/MSCOCO/2017/val2017',
+        ann_file='/mnt/data14/yyg/datasets/Incremental/test_task_1.json',
+        img_prefix='/mnt/data14/yyg/datasets/MSCOCO/2017/val2017',
         seen_classes='datasets/incremental_classes/task1_classes.json',
         all_classes='datasets/incremental_classes/task1_classes.json',
         unseen_classes='datasets/incremental_classes/task0_classes.json',
         pipeline=test_pipeline),
     test=dict(
         type=dataset_type,
-        ann_file='/hy-tmp/datasets/Incremental/test_task_1.json',
-        img_prefix='/hy-tmp/datasets/MSCOCO/2017/val2017', 
+        ann_file='/mnt/data14/yyg/datasets/Incremental/test_task_1.json',
+        img_prefix='/mnt/data14/yyg/datasets/MSCOCO/2017/val2017', 
         seen_classes='datasets/incremental_classes/task1_classes.json',
         all_classes='datasets/incremental_classes/task1_classes.json',
         unseen_classes='datasets/incremental_classes/task0_classes.json',
@@ -294,10 +294,10 @@ lr_config = dict(
     min_lr=1e-7,
 
     warmup='linear',
-    warmup_iters=33564,  # 2张卡
-    # warmup_iters=8394,  # 4张卡
+    # warmup_iters=33564,  # 2张卡
+    warmup_iters=5596,  # 4张卡
     warmup_ratio=0.001,
     )
-runner = dict(type='EpochBasedRunner', max_epochs=30)
+runner = dict(type='EpochBasedRunner', max_epochs=20)
 # fp16 = dict(loss_scale=512.0)
 auto_resume = False

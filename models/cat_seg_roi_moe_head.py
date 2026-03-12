@@ -284,6 +284,18 @@ class CatSegMoERoIHead(StandardRoIHead):
             det_labels.append(det_label)
         return det_bboxes, det_labels
     
+class ResidualExpert(nn.Module):
+    def __init__(self, feat_dim, hidden_dim, text_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(feat_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, text_dim)
+        self.shortcut = nn.Linear(feat_dim, text_dim, bias=False)
+
+    def forward(self, x):
+        return self.fc2(self.act(self.norm(self.fc1(x)))) + self.shortcut(x)
+
 @HEADS.register_module()
 class CatSegMoEBBoxHead(ConvFCBBoxHead):
     def __init__(self, 
@@ -360,10 +372,7 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
         
         self.class_experts = nn.ModuleList([
             nn.Sequential(
-                # nn.Linear(feat_dim, hidden_dim),
-                # nn.LayerNorm(hidden_dim),
-                # nn.ReLU(inplace=True),
-                nn.Linear(feat_dim, text_dim) # 投影到 Text Embedding 所在的语义空间！
+                ResidualExpert(feat_dim, hidden_dim, text_dim)
             ) for _ in range(self.num_classes)
         ])
         
