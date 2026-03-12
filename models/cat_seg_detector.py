@@ -60,7 +60,7 @@ class CatSegDetector(TwoStageDetector):
                             buf_name_old = 'ewc_old_' + name.replace('.', '_')
                             buf_name_fisher = 'ewc_fisher_' + name.replace('.', '_')
                             self.register_buffer(buf_name_old, old_state_dict[name].clone().detach())
-                            self.register_buffer(buf_name_fisher, old_state_dict[name].clone().detach())
+                            self.register_buffer(buf_name_fisher, fisher_dict[name].clone().detach())
                             self.ewc_param_names.append((name, buf_name_old, buf_name_fisher))
                     self.ewc_enable = True
                     print(f"==> [EWC] Protection enabled for {len(self.ewc_param_names)} core feature tensors.")
