@@ -28,6 +28,7 @@ class CatSegDetector(TwoStageDetector):
                  init_cfg=None,
     ):
         super().__init__(backbone, neck, rpn_head, roi_head, train_cfg, test_cfg, pretrained, init_cfg)
+        self.bg_gate = nn.Parameter(torch.tensor([1.0]))
         self.history_backbones = nn.ModuleList()
         self.ewc_weight = ewc_weight
         self.ewc_enable = False
@@ -97,10 +98,11 @@ class CatSegDetector(TwoStageDetector):
 
         spatial_attn, _ = torch.max(cat_seg_logits.sigmoid(), dim=1, keepdim=True)  # [B, 1, H, W]
         spatial_attn = spatial_attn.detach()  # 不反向传播到 backbone
+        gate_val = torch.clamp(self.bg_gate, min=0.0)
         routed_x = []
         for feat in x:
             attn_resized = F.interpolate(spatial_attn, size=feat.shape[-2:], mode='bilinear', align_corners=False)
-            routed_feat = feat * (1.0 + attn_resized)
+            routed_feat = feat * (gate_val + attn_resized)
             routed_x.append(routed_feat)
         routed_x = tuple(routed_x)
             
@@ -140,10 +142,11 @@ class CatSegDetector(TwoStageDetector):
 
         spatial_attn, _ = torch.max(cat_seg_logits.sigmoid(), dim=1, keepdim=True)  # [B, 1, H, W]
         spatial_attn = spatial_attn.detach()  # 不反向传播到 backbone
+        gate_val = torch.clamp(self.bg_gate, min=0.0)
         routed_x = []
         for feat in x:
             attn_resized = F.interpolate(spatial_attn, size=feat.shape[-2:], mode='bilinear', align_corners=False)
-            routed_feat = feat * (1.0 + attn_resized)
+            routed_feat = feat * (gate_val + attn_resized)
             routed_x.append(routed_feat)
         routed_x = tuple(routed_x)
 
