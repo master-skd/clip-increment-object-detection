@@ -22,7 +22,7 @@ class CatSegDetector(TwoStageDetector):
                  train_cfg,
                  test_cfg,
                  history_tasks=None,
-                 ewc_weight=1.0,
+                 ewc_weight=1000.0,
                  fisher_path=None,
                  pretrained=None,
                  init_cfg=None,
@@ -139,6 +139,11 @@ class CatSegDetector(TwoStageDetector):
 
         if cat_seg_logits is not None and cat_seg_logits.shape[1] > 1:
             losses['loss_catseg_ortho'] = self.ortho_loss(cat_seg_logits)
+
+        if self.training and len(self.history_backbones) > 0 and not getattr(self, '_gate_reset_done', False):
+            print("\n==> [Gate] New Task Detected! Forcefully resetting bg_gate to 1.0 to break cold-start deadlock!")
+            self.bg_gate.data.fill_(1.0)
+            self._gate_reset_done = True # 标记已开闸，之后再也不执行
 
         spatial_attn, _ = torch.max(cat_seg_logits.sigmoid(), dim=1, keepdim=True)  # [B, 1, H, W]
         spatial_attn = spatial_attn.detach()  # 不反向传播到 backbone

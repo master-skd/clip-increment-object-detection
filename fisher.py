@@ -92,7 +92,7 @@ if __name__ == '__main__':
     # 示例用法：你可以直接用命令行传参，或者在这里写死
     compute_fisher(
         config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask.py',    # Task 1 的配置文件
-        checkpoint_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_15.pth', # Task 1 训好的权重
+        checkpoint_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_14.pth', # Task 1 训好的权重
         save_path='fisher_task1.pth',       # 你想保存 Fisher 矩阵的位置
         old_fisher_path=None,
         alpha=0.9,

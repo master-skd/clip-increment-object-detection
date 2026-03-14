@@ -48,13 +48,6 @@ class CatSegMoERoIHead(StandardRoIHead):
                       gt_bboxes_ignore=None,
                       gt_masks=None,
                       cat_seg_feats=None,
-                    #   topk_indices=None,
-
-                    #   x_old=None,
-                    #   cat_seg_logits_old=None,
-                    #   teacher_indices=None,
-                    #   teacher_roi_head=None,
-                    #   old_end=19,
                       **kwargs):
         # 分配正负样本逻辑
         num_imgs = len(img_metas)
@@ -182,12 +175,6 @@ class CatSegMoERoIHead(StandardRoIHead):
         if vlm_feat is not None:
             vlm_roi_feats = self.vlm_roi_extractor([vlm_feat], rois)[..., 0, 0]
 
-        # 将 Image 级别的 topk_indices 映射为 Proposal 级别的
-        # if topk_indices is not None:
-        #     batch_inds = rois[:, 0].long()
-        #     proposal_topk_indices = topk_indices[batch_inds] # shape: [N, K]
-        # else:
-        #     proposal_topk_indices = None
 
         # 送入修改过参数量优化的 CatSegMoEBBoxHead
         cls_score, bbox_pred = self.bbox_head(
@@ -295,6 +282,47 @@ class ResidualExpert(nn.Module):
 
     def forward(self, x):
         return self.fc2(self.act(self.norm(self.fc1(x)))) + self.shortcut(x)
+    
+class ConvExpert(nn.Module):
+    def __init__(self, in_channels=256, hidden_channels=64, out_dim=512):
+        super().__init__()
+        # 1x1卷积降维
+        self.conv1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(hidden_channels)
+        self.act1 = nn.ReLU(inplace=True)
+
+        # 3x3卷积提取特征
+        self.conv2 = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(hidden_channels)
+        self.act2 = nn.ReLU(inplace=True)
+
+        # 1x1卷积升维
+        self.conv3 = nn.Conv2d(hidden_channels, in_channels, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(in_channels)
+        self.act3 = nn.ReLU(inplace=True)
+
+        # 投影到text embedding语义空间
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.proj = nn.Linear(in_channels, out_dim)
+
+    def forward(self, x_2d):
+        identity = x_2d 
+        
+        # 空间特征提取
+        out = self.act1(self.bn1(self.conv1(x_2d)))
+        out = self.act2(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+        
+        # 引入残差连接 (极其有利于梯度回传)
+        out = self.act3(out + identity)
+        
+        # 池化并展平: [N, 256, 7, 7] -> [N, 256, 1, 1] -> [N, 256]
+        pooled_feat = self.global_pool(out).flatten(1)
+        
+        # 最终线性投影到 512 维
+        final_embed = self.proj(pooled_feat)
+        
+        return final_embed
 
 @HEADS.register_module()
 class CatSegMoEBBoxHead(ConvFCBBoxHead):
@@ -366,13 +394,19 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
         # feat_dim 是经过 RoIAlign 展平后的特征维度。
         # 原来是 [N, 256, 7, 7] 展平，现在因为你送进来的是拆分好的 Top-K 单类特征，
         # 所以维度依然是 256 * 7 * 7 (假设 FPN 输出是 256 维)
-        self.avg_pool_cls = nn.AdaptiveAvgPool2d((1, 1))
+        # self.avg_pool_cls = nn.AdaptiveAvgPool2d((1, 1))
         feat_dim = self.in_channels
-        hidden_dim = 128 # 专家内部隐藏层维度，可调
+        hidden_dim = 64 # 专家内部隐藏层维度，可调
         
+        # self.class_experts = nn.ModuleList([
+        #     nn.Sequential(
+        #         ResidualExpert(feat_dim, hidden_dim, text_dim)
+        #     ) for _ in range(self.num_classes)
+        # ])
+
         self.class_experts = nn.ModuleList([
             nn.Sequential(
-                ResidualExpert(feat_dim, hidden_dim, text_dim)
+                ConvExpert(in_channels=feat_dim, hidden_channels=hidden_dim, out_dim=text_dim)
             ) for _ in range(self.num_classes)
         ])
         
@@ -381,12 +415,6 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
             for i in range(self.old_end):
                 for p in self.class_experts[i].parameters():
                     p.requires_grad = False
-
-        # self.bg_expert = nn.Sequential(
-        #     nn.Linear(feat_dim, 128),
-        #     nn.ReLU(inplace=True),
-        #     nn.Linear(128, text_dim)
-        # )
 
     @property
     def all_embed(self):
@@ -418,14 +446,9 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
         C = x.shape[1] // num_active  # C 就是 256
         H, W = x.shape[2], x.shape[3]
         
-        # ==========================================
-        # ⚠️ 请严格用下面这两行替换你旧的 flatten 代码！
-        # ==========================================
         x_unfolded = x.view(N, num_active, C, H, W)
         
-        # 先把 N 和 num_active 压平送进池化，池化完立刻 view 变回 3D 张量！
-        # 此时 x_pooled 的形状会变成极其干净的：[N, num_active, 256]
-        x_pooled = self.avg_pool_cls(x_unfolded.flatten(0, 1)).view(N, num_active, C)
+        # x_pooled = self.avg_pool_cls(x_unfolded.flatten(0, 1)).view(N, num_active, C)
         # ==========================================
         
         cls_score = torch.full((N, self.num_classes), -10.0, device=x.device, dtype=x.dtype)
@@ -435,10 +458,8 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
             if cls_id >= self.num_classes:
                 continue
             
-            # 因为 x_pooled 是 [N, num_active, 256]
-            # 这里的切片就能完美取出 [N, 256] 的正确特征块！
-            cls_feats = x_pooled[:, i, :] 
-            
+            cls_feats = x_unfolded[:, i, ...] 
+
             projected_feat = self.class_experts[cls_id](cls_feats) # [N, 256] @ [256, 128] 完美契合！
             projected_feat_norm = F.normalize(projected_feat, p=2, dim=-1, eps=1e-6)
             

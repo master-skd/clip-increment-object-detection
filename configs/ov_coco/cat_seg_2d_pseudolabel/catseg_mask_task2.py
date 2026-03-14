@@ -13,15 +13,14 @@ class_weight = [
 history_tasks = [
     dict(
         config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask.py',
-        weight_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_15.pth' # ⭐ 填入你 Task 1 跑出来的权重绝对路径
+        weight_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_14.pth' # ⭐ 填入你 Task 1 跑出来的权重绝对路径
     )
 ]
 
 model = dict(
     type='CatSegDetector',
     history_tasks=history_tasks,
-    anchor_weight=1e-5,
-    anchor_from_history_idx=-1,
+    fisher_path='fisher_task1.pth',
     backbone=dict(
         type='CatSegEvaCLIPViT',
         model_name='EVA02-CLIP-B-16',
@@ -43,9 +42,6 @@ model = dict(
         attention_type='linear',
         out_indices=[3, 5, 7, 11],  # 输出中间层特征
         cat_seg_indices=[3, 7],
-        # pad_len=select_classes,
-        # old_end=19,
-        # k_old=5,
         norm_cfg=norm_cfg,
     ),
     neck=dict(
@@ -88,7 +84,6 @@ model = dict(
         ),
         bbox_head=dict(
             type='CatSegMoEBBoxHead',
-            # current_classes=current_classes,
             in_channels=256,
             fc_out_channels=512,
             roi_feat_size=7,
@@ -104,7 +99,6 @@ model = dict(
             beta=0.8,
             
             old_end=19,
-            # topk=select_classes,
             class_embed='datasets/embeddings/coco_with_background_evaclip_vitb_16.pt',
             seen_classes='datasets/incremental_classes/task2_classes.json',
             all_classes='datasets/incremental_classes/task12_classes.json',
@@ -126,9 +120,6 @@ model = dict(
             num_shared_fcs=2,
             num_cls_fcs=1,
             num_reg_fcs=1,
-            # conv3d_kernel_size=(1, 3, 3), # (Depth/K, Height, Width) 同时聚合Prompt和空间信息
-            # conv3d_padding=(0, 1, 1),
-            # conv_out_channels=256,    # 卷积层保持通道数不变
         ),
         vlm_roi_extractor=dict(
             type='SingleRoIExtractor',
@@ -151,8 +142,6 @@ model = dict(
                 neg_iou_thr=0.3,
                 min_pos_iou=0.3,
                 match_low_quality=True,
-                # ignore_iof_thr=0.5,
-                # ignore_wrt_candidates=True
             ),
             sampler=dict(
                 type='RandomSampler',
@@ -211,7 +200,7 @@ checkpoint_config = dict(interval=1)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-load_from = 'runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_15.pth'
+load_from = 'runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_14.pth'
 resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0
@@ -275,7 +264,7 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=16,
+    samples_per_gpu=8,
     workers_per_gpu=8,
     train=dict(
         type=dataset_type,
@@ -317,7 +306,7 @@ lr_config = dict(
     warmup='linear',
     # warmup_iters=20958,  # 2张卡
     # warmup_iters=3498,  # 6张卡
-    warmup_iters=3496,
+    warmup_iters=6988,
     warmup_ratio=0.001,
     )
 runner = dict(type='EpochBasedRunner', max_epochs=20)
