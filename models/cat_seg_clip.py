@@ -698,11 +698,9 @@ class Aggregator(nn.Module):
             appearance_guidance: tuple of (B, C, H, W)
         """
         classes = None
-        topk_indices = None
 
         corr = self.correlation(img_feats, text_feats) # shape = [B, P, T, H, W]
 
-        # # !=== 新增: 强制对齐逻辑 ===
         # if force_indices is not None:
         #     classes = force_indices
         #     th_text = F.normalize(text_feats, dim=-1)
@@ -770,9 +768,7 @@ class Aggregator(nn.Module):
             img_feats = F.normalize(img_feats, dim=1) # B C H W
             text_feats = th_text
             corr = torch.einsum('bchw, btpc -> bpthw', img_feats, th_text)
-        #corr = self.feature_map(img_feats, text_feats)
         corr_embed = self.corr_embed(corr) # shape = [B, T, hidden_dim, H, W]
-        # return corr_embed
 
         projected_guidance, projected_text_guidance, projected_decoder_guidance = None, None, [None, None]
         if self.guidance_projection is not None:

@@ -1,25 +1,43 @@
 find_unused_parameters = True
 norm_cfg = dict(type='SyncBN', requires_grad=True)
 num_classes=80
-select_classes=10
 class_weight = [
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.6
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
 ]
+
+history_tasks = [
+    dict(
+        config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask.py',
+        weight_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 1 跑出来的权重绝对路径
+    ),
+    dict(
+        config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask_task2.py',
+        weight_path='runs/cat-seg/test_train_task2_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 2
+    ),
+    dict(
+        config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask_task3.py',
+        weight_path='runs/cat-seg/test_train_task3_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 3
+    )
+]
+
 model = dict(
     type='CatSegDetector',
 
-    old_cfg='/mnt/data14/yyg/F-ViT/configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask_task3.py',
-    old_ckpt="runs/cat-seg/test_train_task3_10_2d_decouple_distill_pseudo_label/epoch_40.pth",
-    use_feature_routing=True,
-    old_end=60,
+    history_tasks=history_tasks,
+    fisher_path='fisher_task3.pth',
+
     backbone=dict(
         type='CatSegEvaCLIPViT',
         model_name='EVA02-CLIP-B-16',
         pretrained=None,
-        class_names='datasets/incremental_classes/task1234_classes.json',
+        class_names='datasets/incremental_classes/task4_classes.json',
         text_guidance_dim=512,
         text_guidance_proj_dim=128,
         appearance_guidance_dim=512,
@@ -36,9 +54,6 @@ model = dict(
         attention_type='linear',
         out_indices=[3, 5, 7, 11],  # 输出中间层特征
         cat_seg_indices=[3, 7],
-        pad_len=select_classes,
-        old_end=60,
-        k_old=5,
         norm_cfg=norm_cfg,
     ),
     neck=dict(
@@ -51,15 +66,8 @@ model = dict(
     
     rpn_head=dict(
         type='RPNHead',
-        # split_idx=19,
         in_channels=256,
         feat_channels=256,
-        # cost_roi_extractor=dict(
-        #     type='SingleRoIExtractor',
-        #     roi_layer=dict(type='RoIAlign', output_size=1, sampling_ratio=0), # output_size=1 做平均池化
-        #     out_channels=1, # 这里其实不重要，MMDet 只是用来检查通道数，填 1 即可
-        #     featmap_strides=[16] # <--- 关键！必须和 Cost Volume 的 stride 一致 (ViT-B通常是16)
-        # ),
         anchor_generator=dict(
             type='AnchorGenerator',
             scales=[8],
@@ -79,22 +87,16 @@ model = dict(
     ),
 
     roi_head=dict(
-        type='CatSegMaskRoIHead',
+        type='CatSegMoERoIHead',
         bbox_roi_extractor=dict(
             type='SingleRoIExtractor',
             roi_layer=dict(type='RoIAlign', output_size=7, sampling_ratio=0),
-            out_channels=256*(select_classes),
+            out_channels=256,
             featmap_strides=[4, 8, 16, 32],
         ),
-        # cost_roi_extractor=dict(
-        #     type='SingleRoIExtractor',
-        #     roi_layer=dict(type='RoIAlign', output_size=1, sampling_ratio=0), # output_size=1 做平均池化
-        #     out_channels=1, # 这里其实不重要，MMDet 只是用来检查通道数，填 1 即可
-        #     featmap_strides=[16] # <--- 关键！必须和 Cost Volume 的 stride 一致 (ViT-B通常是16)
-        # ),
         bbox_head=dict(
-            type='CatSegMaskBBoxHead',
-            in_channels=256*(select_classes),
+            type='CatSegMoEBBoxHead',
+            in_channels=256,
             fc_out_channels=512,
             roi_feat_size=7,
             text_dim=512,
@@ -107,8 +109,8 @@ model = dict(
             vlm_temperature=75.0,
             alpha=0.1,
             beta=0.8,
-            old_end=19,
-            is_incremental=True,
+
+            old_end=60,
             class_embed='datasets/embeddings/coco_with_background_evaclip_vitb_16.pt',
             seen_classes='datasets/incremental_classes/task4_classes.json',
             all_classes='datasets/incremental_classes/task1234_classes.json',
@@ -117,22 +119,19 @@ model = dict(
                 target_means=[0.0, 0.0, 0.0, 0.0],
                 target_stds=[0.1, 0.1, 0.2, 0.2],
             ),
-            loss_cls=dict(
-                type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0
-            ),
             # loss_cls=dict(
-            #     type='CustomCrossEntropyLoss',
-            #     use_sigmoid=False,
-            #     loss_weight=1.0,
-            #     class_weight=class_weight),
+            #     type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0
+            # ),
+            loss_cls=dict(
+                type='CustomCrossEntropyLoss',
+                use_sigmoid=True,
+                loss_weight=1.0,
+                class_weight=class_weight),
             loss_bbox=dict(type='L1Loss', loss_weight=1.0),
             num_shared_convs=4,
             num_shared_fcs=2,
             num_cls_fcs=1,
             num_reg_fcs=1,
-            # conv3d_kernel_size=(1, 3, 3), # (Depth/K, Height, Width) 同时聚合Prompt和空间信息
-            # conv3d_padding=(0, 1, 1),
-            # conv_out_channels=256,    # 卷积层保持通道数不变
         ),
         vlm_roi_extractor=dict(
             type='SingleRoIExtractor',
@@ -155,8 +154,6 @@ model = dict(
                 neg_iou_thr=0.3,
                 min_pos_iou=0.3,
                 match_low_quality=True,
-                # ignore_iof_thr=0.5,
-                # ignore_wrt_candidates=True
             ),
             sampler=dict(
                 type='RandomSampler',
@@ -211,11 +208,11 @@ model = dict(
     )
 )
 
-checkpoint_config = dict(interval=5)
+checkpoint_config = dict(interval=10)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-load_from = 'runs/cat-seg/test_train_task3_10_2d_decouple_distill_pseudo_label/epoch_40.pth'
+load_from = 'runs/cat-seg/test_train_task3_10_2d_moe_sigmoid/epoch_20.pth'
 resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0
@@ -279,13 +276,11 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=16,
+    samples_per_gpu=8,
     workers_per_gpu=8,
     train=dict(
         type=dataset_type,
-        # ann_file=
-        # '/mnt/data14/yyg/datasets/Incremental/train_task_2.json',
-        ann_file='/mnt/data14/yyg/F-ViT/train_task4_with_pseudo_labels_2d.json',
+        ann_file='/mnt/data14/yyg/datasets/Incremental/train_task_4.json',
         img_prefix='/mnt/data14/yyg/datasets/MSCOCO/2017/train2017',
         seen_classes='datasets/incremental_classes/task4_classes.json',
         all_classes='datasets/incremental_classes/task1234_classes.json',
@@ -321,9 +316,10 @@ lr_config = dict(
 
     warmup='linear',
     # warmup_iters=13976,  # 2张卡
-    warmup_iters=6992,  # 4张卡
+    # warmup_iters=6992,  # 4张卡
+    warmup_iters=2436,  # 8张卡
     warmup_ratio=0.001,
     )
-runner = dict(type='EpochBasedRunner', max_epochs=30)
+runner = dict(type='EpochBasedRunner', max_epochs=20)
 # fp16 = dict(loss_scale=512.0)
 auto_resume = False

@@ -1,15 +1,37 @@
 find_unused_parameters = True
 norm_cfg = dict(type='SyncBN', requires_grad=True)
-num_classes=19
-# select_classes=10
+num_classes=60
+class_weight = [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
+]
+
+history_tasks = [
+    dict(
+        config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask.py',
+        weight_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 1 跑出来的权重绝对路径
+    ),
+    dict(
+        config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask_task2.py',
+        weight_path='runs/cat-seg/test_train_task2_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 2
+    )
+]
+
 model = dict(
     type='CatSegDetector',
 
+    history_tasks=history_tasks,
+    fisher_path='fisher_task2.pth',
+    
     backbone=dict(
         type='CatSegEvaCLIPViT',
         model_name='EVA02-CLIP-B-16',
-        pretrained='checkpoints/FineCLIP_coco_vitb16.pt',
-        class_names='datasets/incremental_classes/task1_classes.json',
+        pretrained=None,
+        class_names='datasets/incremental_classes/task3_classes.json',
         text_guidance_dim=512,
         text_guidance_proj_dim=128,
         appearance_guidance_dim=512,
@@ -26,12 +48,8 @@ model = dict(
         attention_type='linear',
         out_indices=[3, 5, 7, 11],  # 输出中间层特征
         cat_seg_indices=[3, 7],
-        # pad_len=select_classes,
-        # old_end=0,
-        # k_old=0,
         norm_cfg=norm_cfg,
     ),
-    
     neck=dict(
         type='FPN',
         in_channels=[768, 768, 768, 768],
@@ -42,7 +60,6 @@ model = dict(
     
     rpn_head=dict(
         type='RPNHead',
-        # ambiguous_thresh=1.0,
         in_channels=256,
         feat_channels=256,
         anchor_generator=dict(
@@ -87,28 +104,25 @@ model = dict(
             alpha=0.1,
             beta=0.8,
 
-            old_end=0,
-            # topk=select_classes,
+            old_end=40,
             class_embed='datasets/embeddings/coco_with_background_evaclip_vitb_16.pt',
-            seen_classes='datasets/incremental_classes/task1_classes.json',
-            all_classes='datasets/incremental_classes/task1_classes.json',
+            seen_classes='datasets/incremental_classes/task3_classes.json',
+            all_classes='datasets/incremental_classes/task123_classes.json',
             bbox_coder=dict(
                 type='DeltaXYWHBBoxCoder',
                 target_means=[0.0, 0.0, 0.0, 0.0],
                 target_stds=[0.1, 0.1, 0.2, 0.2],
             ),
             loss_cls=dict(
-                type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0
-            ),
+                type='CustomCrossEntropyLoss',
+                use_sigmoid=True,
+                loss_weight=1.0,
+                class_weight=class_weight),
             loss_bbox=dict(type='L1Loss', loss_weight=1.0),
             num_shared_convs=4,
             num_shared_fcs=2,
             num_cls_fcs=1,
             num_reg_fcs=1,
-
-            # conv3d_kernel_size=(1, 3, 3), # (Depth/K, Height, Width) 同时聚合Prompt和空间信息
-            # conv3d_padding=(0, 1, 1),
-            # conv_out_channels=256,    # 卷积层保持通道数不变
         ),
         vlm_roi_extractor=dict(
             type='SingleRoIExtractor',
@@ -131,7 +145,6 @@ model = dict(
                 neg_iou_thr=0.3,
                 min_pos_iou=0.3,
                 match_low_quality=True,
-                ignore_iof_thr=-1
             ),
             sampler=dict(
                 type='RandomSampler',
@@ -186,11 +199,11 @@ model = dict(
     )
 )
 
-checkpoint_config = dict(interval=1)
+checkpoint_config = dict(interval=10)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-load_from = None
+load_from = 'runs/cat-seg/test_train_task2_10_2d_moe_sigmoid/epoch_20.pth'
 resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0
@@ -258,28 +271,27 @@ data = dict(
     workers_per_gpu=8,
     train=dict(
         type=dataset_type,
-        ann_file=
-        '/mnt/data14/yyg/datasets/Incremental/train_task_1.json',
+        ann_file='/mnt/data14/yyg/datasets/Incremental/train_task_3.json',
         img_prefix='/mnt/data14/yyg/datasets/MSCOCO/2017/train2017',
-        seen_classes='datasets/incremental_classes/task1_classes.json',
-        all_classes='datasets/incremental_classes/task1_classes.json',
-        unseen_classes='datasets/incremental_classes/task0_classes.json',
+        seen_classes='datasets/incremental_classes/task3_classes.json',
+        all_classes='datasets/incremental_classes/task123_classes.json',
+        unseen_classes='datasets/incremental_classes/task12_classes.json',
         pipeline=train_pipeline),
     val=dict(
         type=dataset_type,
-        ann_file='/mnt/data14/yyg/datasets/Incremental/test_task_1.json',
+        ann_file='/mnt/data14/yyg/datasets/Incremental/test_task_123.json',
         img_prefix='/mnt/data14/yyg/datasets/MSCOCO/2017/val2017',
-        seen_classes='datasets/incremental_classes/task1_classes.json',
-        all_classes='datasets/incremental_classes/task1_classes.json',
-        unseen_classes='datasets/incremental_classes/task0_classes.json',
+        seen_classes='datasets/incremental_classes/task3_classes.json',
+        all_classes='datasets/incremental_classes/task123_classes.json',
+        unseen_classes='datasets/incremental_classes/task12_classes.json',
         pipeline=test_pipeline),
     test=dict(
         type=dataset_type,
-        ann_file='/mnt/data14/yyg/datasets/Incremental/test_task_1.json',
+        ann_file='/mnt/data14/yyg/datasets/Incremental/test_task_123.json',
         img_prefix='/mnt/data14/yyg/datasets/MSCOCO/2017/val2017', 
-        seen_classes='datasets/incremental_classes/task1_classes.json',
-        all_classes='datasets/incremental_classes/task1_classes.json',
-        unseen_classes='datasets/incremental_classes/task0_classes.json',
+        seen_classes='datasets/incremental_classes/task3_classes.json',
+        all_classes='datasets/incremental_classes/task123_classes.json',
+        unseen_classes='datasets/incremental_classes/task12_classes.json',
         pipeline=test_pipeline)
 )
 evaluation = dict(interval=1, metric=['bbox'])
@@ -294,8 +306,8 @@ lr_config = dict(
     min_lr=1e-7,
 
     warmup='linear',
-    # warmup_iters=33564,  # 2张卡
-    warmup_iters=11188,  # 4张卡
+    # warmup_iters=13976,  # 2张卡
+    warmup_iters=4932,  # 4张卡
     warmup_ratio=0.001,
     )
 runner = dict(type='EpochBasedRunner', max_epochs=20)
