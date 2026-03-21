@@ -12,3 +12,5 @@ datasets/__pycache__/
 tools/__pycache__
 /vis_results/
 ./debug_vis_results
+fisher_task1.pth
+fisher_task2.pth

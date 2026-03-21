@@ -340,8 +340,6 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
                  beta=0.45,
                  
                  old_end=None,
-                 current_classes=None,
-                #  topk=None,
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -433,12 +431,12 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
         else:
             normalized_vlm_box_feats = None
         
-        if self.training and self.old_end is not None and self.old_end > 0:
-            # Task 2 训练阶段：只激活新类
-            active_classes = list(range(self.old_end, self.num_classes))
-        else:
-            # 测试阶段 (或 Task 1 训练)：激活所有类
-            active_classes = list(range(self.num_classes))
+        # if self.training and self.old_end is not None and self.old_end > 0:
+        #     # Task 2 训练阶段：只激活新类
+        #     active_classes = list(range(self.old_end, self.num_classes))
+        # else:
+        #     # 测试阶段 (或 Task 1 训练)：激活所有类
+        active_classes = list(range(self.num_classes))
 
         # x 的维度目前是：[N, K * 256, 7, 7] (因为你在 RoIHead 里 rearrange 了)
         N = x.shape[0]

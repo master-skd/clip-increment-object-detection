@@ -10,28 +10,29 @@ class_weight = [
     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
 ]
 
-history_tasks = [
-    dict(
-        config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask.py',
-        weight_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 1 跑出来的权重绝对路径
-    ),
-    dict(
-        config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask_task2.py',
-        weight_path='runs/cat-seg/test_train_task2_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 2
-    )
-]
+# history_tasks = [
+#     dict(
+#         config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask.py',
+#         weight_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 1 跑出来的权重绝对路径
+#     ),
+#     dict(
+#         config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask_task2.py',
+#         weight_path='runs/cat-seg/test_train_task2_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 2
+#     )
+# ]
 
 model = dict(
     type='CatSegDetector',
 
-    history_tasks=history_tasks,
+    # history_tasks=history_tasks,
+    prev_model_path='runs/cat-seg/test_train_task2_10_2d_moe_sigmoid/epoch_20.pth',
     fisher_path='fisher_task2.pth',
     
     backbone=dict(
         type='CatSegEvaCLIPViT',
         model_name='EVA02-CLIP-B-16',
         pretrained=None,
-        class_names='datasets/incremental_classes/task3_classes.json',
+        class_names='datasets/incremental_classes/task123_classes.json',
         text_guidance_dim=512,
         text_guidance_proj_dim=128,
         appearance_guidance_dim=512,
@@ -199,7 +200,7 @@ model = dict(
     )
 )
 
-checkpoint_config = dict(interval=10)
+checkpoint_config = dict(interval=5)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
@@ -267,7 +268,7 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=8,
+    samples_per_gpu=4,
     workers_per_gpu=8,
     train=dict(
         type=dataset_type,

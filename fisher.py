@@ -91,10 +91,10 @@ def compute_fisher(config_path, checkpoint_path, save_path, old_fisher_path=None
 if __name__ == '__main__':
     # 示例用法：你可以直接用命令行传参，或者在这里写死
     compute_fisher(
-        config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask_task3.py',    # Task 2 的配置文件
-        checkpoint_path='runs/cat-seg/test_train_task3_10_2d_moe_sigmoid/epoch_20.pth', # Task 2 训好的权重
-        save_path='fisher_task3.pth',       # 你想保存 Fisher 矩阵的位置
-        old_fisher_path='fisher_task2.pth',
-        alpha=0.9,
+        config_path='configs/ov_coco/cat_seg_2d_4tasks/catseg_mask_task2.py',    # Task 2 的配置文件
+        checkpoint_path='runs/cat-seg/test_train_task2_10_2d_moe_sigmoid/epoch_20.pth', # Task 2 训好的权重
+        save_path='fisher_task2.pth',       # 你想保存 Fisher 矩阵的位置
+        old_fisher_path='fisher_task1.pth',  # Task 1 的 Fisher 矩阵路径，如果没有就设为 None
+        alpha=1.0,
         num_samples=500  # 抽样数量
     )

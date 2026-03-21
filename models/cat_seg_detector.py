@@ -21,11 +21,12 @@ class CatSegDetector(TwoStageDetector):
                  roi_head,
                  train_cfg,
                  test_cfg,
-                 history_tasks=None,
+                #  history_tasks=None,
                  ewc_weight=1000.0,
                  fisher_path=None,
                  pretrained=None,
                  init_cfg=None,
+                 prev_model_path=None,
     ):
         super().__init__(backbone, neck, rpn_head, roi_head, train_cfg, test_cfg, pretrained, init_cfg)
         self.bg_gate = nn.Parameter(torch.tensor([1.0]))
@@ -33,63 +34,81 @@ class CatSegDetector(TwoStageDetector):
         self.ewc_weight = ewc_weight
         self.ewc_enable = False
         self.ewc_param_names = []
-        if history_tasks is not None and len(history_tasks) > 0:
-            print(f"==> [CatSegDetector] Reading {len(history_tasks)} history configs...")
-            fisher_dict = torch.load(fisher_path, map_location='cpu') if fisher_path else None
-            for idx, task_info in enumerate(history_tasks):
-                old_cfg = Config.fromfile(task_info['config_path'])
-                old_model = build_detector(
-                    old_cfg.model,
-                    train_cfg=old_cfg.get('train_cfg'),
-                    test_cfg=old_cfg.get('test_cfg')
-                )
-                load_checkpoint(old_model, task_info['weight_path'], map_location='cpu', strict=False)
-                old_bb = old_model.backbone
-                old_bb.eval()
-                for param in old_bb.parameters():
-                    param.requires_grad = False
-                self.history_backbones.append(old_bb)
+        # if history_tasks is not None and len(history_tasks) > 0:
+        #     print(f"==> [CatSegDetector] Reading {len(history_tasks)} history configs...")
+        #     fisher_dict = torch.load(fisher_path, map_location='cpu') if fisher_path else None
+        #     for idx, task_info in enumerate(history_tasks):
+        #         old_cfg = Config.fromfile(task_info['config_path'])
+        #         old_model = build_detector(
+        #             old_cfg.model,
+        #             train_cfg=old_cfg.get('train_cfg'),
+        #             test_cfg=old_cfg.get('test_cfg')
+        #         )
+        #         load_checkpoint(old_model, task_info['weight_path'], map_location='cpu', strict=False)
+        #         old_bb = old_model.backbone
+        #         old_bb.eval()
+        #         for param in old_bb.parameters():
+        #             param.requires_grad = False
+        #         self.history_backbones.append(old_bb)
 
-                # EWC初始化
-                is_last_task = (idx == len(history_tasks) - 1)
-                if is_last_task and fisher_dict is not None:
-                    print("==> [EWC] Initializing Elastic Weight Consolidation from the latest task...")
-                    old_state_dict = old_model.state_dict()
-                    protected_prefixes = ['neck.']
-                    for name, param in self.named_parameters():
-                        if any(name.startswith(p) for p in protected_prefixes) and param.requires_grad:
-                            buf_name_old = 'ewc_old_' + name.replace('.', '_')
-                            buf_name_fisher = 'ewc_fisher_' + name.replace('.', '_')
-                            self.register_buffer(buf_name_old, old_state_dict[name].clone().detach())
-                            self.register_buffer(buf_name_fisher, fisher_dict[name].clone().detach())
-                            self.ewc_param_names.append((name, buf_name_old, buf_name_fisher))
-                    self.ewc_enable = True
-                    print(f"==> [EWC] Protection enabled for {len(self.ewc_param_names)} core feature tensors.")
+        #         # EWC初始化
+        #         is_last_task = (idx == len(history_tasks) - 1)
+        #         if is_last_task and fisher_dict is not None:
+        #             print("==> [EWC] Initializing Elastic Weight Consolidation from the latest task...")
+        #             old_state_dict = old_model.state_dict()
+        #             protected_prefixes = ['neck.']
+        #             for name, param in self.named_parameters():
+        #                 if any(name.startswith(p) for p in protected_prefixes) and param.requires_grad:
+        #                     buf_name_old = 'ewc_old_' + name.replace('.', '_')
+        #                     buf_name_fisher = 'ewc_fisher_' + name.replace('.', '_')
+        #                     self.register_buffer(buf_name_old, old_state_dict[name].clone().detach())
+        #                     self.register_buffer(buf_name_fisher, fisher_dict[name].clone().detach())
+        #                     self.ewc_param_names.append((name, buf_name_old, buf_name_fisher))
+        #             self.ewc_enable = True
+        #             print(f"==> [EWC] Protection enabled for {len(self.ewc_param_names)} core feature tensors.")
 
-                del old_model
-            print("==> [CatSegDetector] History backbones loaded seamlessly via mmcv.load_checkpoint!")
+        #         del old_model
+        #     print("==> [CatSegDetector] History backbones loaded seamlessly via mmcv.load_checkpoint!")
+
+        if fisher_path is not None and prev_model_path is not None:
+            fisher_dict = torch.load(fisher_path, map_location='cpu')
+            print("==> [EWC] Initializing Elastic Weight Consolidation from the latest task...")
+
+            prev_checkpoint = torch.load(prev_model_path, map_location='cpu')
+            old_state_dict = prev_checkpoint.get('state_dict', prev_checkpoint)
+            old_state_dict = {k.replace('module.', ''): v for k, v in old_state_dict.items()}
+            
+            protected_prefixes = ['neck.']
+            for name, param in self.named_parameters():
+                if any(name.startswith(p) for p in protected_prefixes) and param.requires_grad:
+                    buf_name_old = 'ewc_old_' + name.replace('.', '_')
+                    buf_name_fisher = 'ewc_fisher_' + name.replace('.', '_')
+                    self.register_buffer(buf_name_old, old_state_dict[name].clone().detach())
+                    self.register_buffer(buf_name_fisher, fisher_dict[name].clone().detach())
+                    self.ewc_param_names.append((name, buf_name_old, buf_name_fisher))
+            self.ewc_enable = True
+            print(f"==> [EWC] Protection enabled for {len(self.ewc_param_names)} core feature tensors.")
 
         self.ortho_loss = SegOrthogonalLoss(loss_weight=1.0)
 
     def simple_test(self, img, img_metas, proposals=None, rescale=False):
         assert self.with_bbox, 'Bbox head must be implemented.'
 
-        all_logits = []
-        if len(self.history_backbones) > 0:
-            with torch.no_grad():
-                for old_bb in self.history_backbones:
-                    old_bb.eval()
-                    old_res_feats = old_bb(img)
-                    old_logits = old_res_feats[-2] # 提取历史 Logits
-                    all_logits.append(old_logits)
+        # all_logits = []
+        # if len(self.history_backbones) > 0:
+        #     with torch.no_grad():
+        #         for old_bb in self.history_backbones:
+        #             old_bb.eval()
+        #             old_res_feats = old_bb(img)
+        #             old_logits = old_res_feats[-2] # 提取历史 Logits
+        #             all_logits.append(old_logits)
 
         res_feats = self.backbone(img)
-        # cat_seg_logits = res_feats[-2]
-        current_logits = res_feats[-2]
+        cat_seg_logits = res_feats[-2]
+        # current_logits = res_feats[-2]
 
-        all_logits.append(current_logits)
-        cat_seg_logits = torch.cat(all_logits, dim=1)  # 在通道维度拼接 Logits
-        # topk_indices = res_feats[-2]
+        # all_logits.append(current_logits)
+        # cat_seg_logits = torch.cat(all_logits, dim=1)  # 在通道维度拼接 Logits
 
         if self.with_neck:
             x = self.neck(res_feats[:-2])
@@ -146,7 +165,7 @@ class CatSegDetector(TwoStageDetector):
             self._gate_reset_done = True # 标记已开闸，之后再也不执行
 
         spatial_attn, _ = torch.max(cat_seg_logits.sigmoid(), dim=1, keepdim=True)  # [B, 1, H, W]
-        spatial_attn = spatial_attn.detach()  # 不反向传播到 backbone
+        spatial_attn = spatial_attn.detach()
         gate_val = torch.clamp(self.bg_gate, min=0.0)
         routed_x = []
         for feat in x:
