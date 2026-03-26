@@ -24,7 +24,7 @@ import models    # noqa
 import datasets   # noqa
 import signal
 import setproctitle
-setproctitle.setproctitle('yyg')
+setproctitle.setproctitle('reconvla-2')
 
 
 def parse_args():

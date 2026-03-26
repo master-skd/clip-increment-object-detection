@@ -268,7 +268,7 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=4,
+    samples_per_gpu=2,
     workers_per_gpu=8,
     train=dict(
         type=dataset_type,
@@ -308,7 +308,7 @@ lr_config = dict(
 
     warmup='linear',
     # warmup_iters=13976,  # 2张卡
-    warmup_iters=4932,  # 4张卡
+    warmup_iters=9856,  # 4张卡
     warmup_ratio=0.001,
     )
 runner = dict(type='EpochBasedRunner', max_epochs=20)

@@ -1,5 +1,6 @@
 find_unused_parameters = True
-norm_cfg = dict(type='SyncBN', requires_grad=True)
+# norm_cfg = dict(type='SyncBN', requires_grad=True)
+norm_cfg = dict(type='GN', num_groups=32, requires_grad=True)
 num_classes=19
 model = dict(
     type='CatSegDetector',
@@ -286,6 +287,7 @@ lr_config = dict(
     warmup='linear',
     # warmup_iters=33564,  # 2张卡
     warmup_iters=11188,  # 4张卡
+    # warmup_iters=5596, # 8张卡
     warmup_ratio=0.001,
     )
 runner = dict(type='EpochBasedRunner', max_epochs=20)

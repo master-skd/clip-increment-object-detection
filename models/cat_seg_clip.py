@@ -1102,7 +1102,8 @@ class CatSegEvaCLIPViT(BaseModule):
             outs[idx] = interpolate(out.detach())
         outs.append(logits)
         # outs.append(topk_indices)
-        outs.append(img_feats) if not self.training else outs.append(None)
+        # outs.append(img_feats) if not self.training else outs.append(None)
+        outs.append(img_feats)
         return outs  # 4个多尺度特征 + 最终logits
     
     def forward_with_text(self, x, text_feats_override, force_indices=None):

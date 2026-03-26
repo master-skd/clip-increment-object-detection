@@ -27,6 +27,7 @@ class CatSegDetector(TwoStageDetector):
                  pretrained=None,
                  init_cfg=None,
                  prev_model_path=None,
+                 old_end=19
     ):
         super().__init__(backbone, neck, rpn_head, roi_head, train_cfg, test_cfg, pretrained, init_cfg)
         self.bg_gate = nn.Parameter(torch.tensor([1.0]))
@@ -147,7 +148,7 @@ class CatSegDetector(TwoStageDetector):
                       **kwargs):
 
         res_feats = self.backbone(img)
-        cat_seg_logits = res_feats[-2]
+        cat_seg_logits = res_feats[-2]  # [B, K, H, W]
 
         if self.with_neck:
             x = self.neck(res_feats[:-2])

@@ -1,5 +1,6 @@
 find_unused_parameters = True
-norm_cfg = dict(type='SyncBN', requires_grad=True)
+# norm_cfg = dict(type='SyncBN', requires_grad=True)
+norm_cfg = dict(type='GN', num_groups=32, requires_grad=True)
 num_classes=40
 class_weight = [
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
@@ -18,8 +19,8 @@ class_weight = [
 model = dict(
     type='CatSegDetector',
     # history_tasks=history_tasks,
-    fisher_path='fisher_task1.pth',
-    prev_model_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_20.pth',
+    # fisher_path='fisher_task1.pth',
+    # prev_model_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_20.pth',
     backbone=dict(
         type='CatSegEvaCLIPViT',
         model_name='EVA02-CLIP-B-16',
@@ -138,6 +139,7 @@ model = dict(
                 neg_iou_thr=0.3,
                 min_pos_iou=0.3,
                 match_low_quality=True,
+                ignore_iof_thr=-1
             ),
             sampler=dict(
                 type='RandomSampler',
@@ -192,11 +194,11 @@ model = dict(
     )
 )
 
-checkpoint_config = dict(interval=10)
+checkpoint_config = dict(interval=1)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-load_from = 'runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_20.pth'
+load_from = 'runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_10.pth'
 resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0
@@ -260,7 +262,7 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=8,
+    samples_per_gpu=4,
     workers_per_gpu=8,
     train=dict(
         type=dataset_type,
@@ -302,7 +304,8 @@ lr_config = dict(
     warmup='linear',
     # warmup_iters=20958,  # 2张卡
     # warmup_iters=3498,  # 6张卡
-    warmup_iters=3496,
+    # warmup_iters=13972,
+    warmup_iters=6988,
     warmup_ratio=0.001,
     )
 runner = dict(type='EpochBasedRunner', max_epochs=20)

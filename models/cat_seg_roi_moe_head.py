@@ -288,17 +288,20 @@ class ConvExpert(nn.Module):
         super().__init__()
         # 1x1卷积降维
         self.conv1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(hidden_channels)
+        # self.bn1 = nn.BatchNorm2d(hidden_channels)
+        self.gn1 = nn.GroupNorm(num_groups=16, num_channels=hidden_channels)
         self.act1 = nn.ReLU(inplace=True)
 
         # 3x3卷积提取特征
         self.conv2 = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(hidden_channels)
+        # self.bn2 = nn.BatchNorm2d(hidden_channels)
+        self.gn2 = nn.GroupNorm(num_groups=16, num_channels=hidden_channels)
         self.act2 = nn.ReLU(inplace=True)
 
         # 1x1卷积升维
         self.conv3 = nn.Conv2d(hidden_channels, in_channels, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(in_channels)
+        # self.bn3 = nn.BatchNorm2d(in_channels)
+        self.gn3 = nn.GroupNorm(num_groups=32, num_channels=in_channels)
         self.act3 = nn.ReLU(inplace=True)
 
         # 投影到text embedding语义空间
@@ -309,9 +312,9 @@ class ConvExpert(nn.Module):
         identity = x_2d 
         
         # 空间特征提取
-        out = self.act1(self.bn1(self.conv1(x_2d)))
-        out = self.act2(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
+        out = self.act1(self.gn1(self.conv1(x_2d)))
+        out = self.act2(self.gn2(self.conv2(out)))
+        out = self.gn3(self.conv3(out))
         
         # 引入残差连接 (极其有利于梯度回传)
         out = self.act3(out + identity)
@@ -458,7 +461,7 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
             
             cls_feats = x_unfolded[:, i, ...] 
 
-            projected_feat = self.class_experts[cls_id](cls_feats) # [N, 256] @ [256, 128] 完美契合！
+            projected_feat = self.class_experts[cls_id](cls_feats)
             projected_feat_norm = F.normalize(projected_feat, p=2, dim=-1, eps=1e-6)
             
             # 取出文本 Embedding 算余弦相似度
@@ -523,8 +526,10 @@ class CatSegMoEBBoxHead(ConvFCBBoxHead):
                    rescale=False,
                    cfg=None):
         # scores = F.softmax(cls_score, dim=-1)
-        # scores = scores[:, :-1]  # 去掉背景分数
         scores = cls_score.sigmoid()
+        # nms默认是带背景类的，否则会导致最后一个类的召回为0
+        padding = scores.new_zeros(scores.shape[0], 1)
+        scores = torch.cat([scores, padding], dim=1)
         if bbox_pred is not None:
             bboxes = self.bbox_coder.decode(
                 rois[..., 1:], bbox_pred, max_shape=img_shape
