@@ -2,6 +2,7 @@ find_unused_parameters = True
 # norm_cfg = dict(type='SyncBN', requires_grad=True)
 norm_cfg = dict(type='GN', num_groups=32, requires_grad=True)
 num_classes=40
+prev_task_ckpt = 'runs/cat-seg/ablation_ewc/test_train_task1_10_2d_moe_sigmoid/epoch_20.pth'
 class_weight = [
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
@@ -9,18 +10,15 @@ class_weight = [
     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
 ]
 
-# history_tasks = [
-#     dict(
-#         config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask.py',
-#         weight_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 1 跑出来的权重绝对路径
-#     )
-# ]
-
 model = dict(
     type='CatSegDetector',
     # history_tasks=history_tasks,
-    # fisher_path='fisher_task1.pth',
-    # prev_model_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_20.pth',
+    # EWC is disabled by not providing fisher_path.
+    # prev_model_path=prev_task_ckpt,
+    # use_gda_fpn=True,
+    # gda_ref_source='feat',
+    # gda_lambda=1.0,
+    # gda_weight=1.0,
     backbone=dict(
         type='CatSegEvaCLIPViT',
         model_name='EVA02-CLIP-B-16',
@@ -198,7 +196,7 @@ checkpoint_config = dict(interval=1)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-load_from = 'runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_10.pth'
+load_from = prev_task_ckpt
 resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0
@@ -290,9 +288,11 @@ data = dict(
         unseen_classes='datasets/incremental_classes/task1_classes.json',
         pipeline=test_pipeline)
 )
-evaluation = dict(interval=1, metric=['bbox'])
+evaluation = dict(interval=5, metric=['bbox'])
 optimizer = dict(type='AdamW', lr=0.0004, betas=(0.9, 0.999), weight_decay=0.1)
 optimizer_config = dict(
+    type='GradientCumulativeOptimizerHook',
+    cumulative_iters=4,
     grad_clip=dict(max_norm=1.0, norm_type=2),
 )
 lr_config = dict(
@@ -304,8 +304,8 @@ lr_config = dict(
     warmup='linear',
     # warmup_iters=20958,  # 2张卡
     # warmup_iters=3498,  # 6张卡
-    # warmup_iters=13972,
-    warmup_iters=6988,
+    warmup_iters=13972,
+    # warmup_iters=6992,
     warmup_ratio=0.001,
     )
 runner = dict(type='EpochBasedRunner', max_epochs=20)

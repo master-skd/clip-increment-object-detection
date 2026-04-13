@@ -10,17 +10,6 @@ class_weight = [
     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
 ]
 
-# history_tasks = [
-#     dict(
-#         config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask.py',
-#         weight_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 1 跑出来的权重绝对路径
-#     ),
-#     dict(
-#         config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask_task2.py',
-#         weight_path='runs/cat-seg/test_train_task2_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 2
-#     )
-# ]
-
 model = dict(
     type='CatSegDetector',
 

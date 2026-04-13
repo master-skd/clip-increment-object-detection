@@ -1,5 +1,6 @@
 find_unused_parameters = True
-norm_cfg = dict(type='SyncBN', requires_grad=True)
+# norm_cfg = dict(type='SyncBN', requires_grad=True)
+norm_cfg = dict(type='GN', num_groups=32, requires_grad=True)
 num_classes=40
 model = dict(
     type='CatSegDetector',

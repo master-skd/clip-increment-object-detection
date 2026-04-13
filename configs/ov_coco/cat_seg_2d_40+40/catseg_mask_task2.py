@@ -11,17 +11,12 @@ class_weight = [
     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 
     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
 ]
-history_tasks = [
-    dict(
-        config_path='configs/ov_coco/cat_seg_2d_40+40/catseg_mask.py',
-        weight_path='runs/cat-seg/test_train_task1_40+40_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 1 跑出来的权重绝对路径
-    ),
-]
+
 model = dict(
     type='CatSegDetector',
 
-    history_tasks=history_tasks,
     fisher_path='fisher_task1.pth',
+    prev_model_path='runs/cat-seg/test_train_task1_40+40_10_2d_moe_sigmoid/epoch_20.pth',
 
     backbone=dict(
         type='CatSegEvaCLIPViT',
