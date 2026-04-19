@@ -38,7 +38,9 @@ class CatSegDetector(TwoStageDetector):
                  gda_fallback_to_feat=False,
                  use_nsgp_fpn=False,
                  nsgp_proj_path=None,
-                 nsgp_lambda=1.0
+                 nsgp_lambda=1.0,
+                 reg_type='ewc',
+                 incdet_beta=0.001
     ):
         super().__init__(backbone, neck, rpn_head, roi_head, train_cfg, test_cfg, pretrained, init_cfg)
         self.bg_gate = nn.Parameter(torch.tensor([1.0]))
@@ -66,6 +68,12 @@ class CatSegDetector(TwoStageDetector):
         self.nsgp_neck_param_names = []
         self._nsgp_transforms = {}
         self._nsgp_hook_handles = []
+        self.reg_type = str(reg_type).lower()
+        self.incdet_beta = float(incdet_beta)
+        if self.reg_type not in ('ewc', 'incdet'):
+            raise ValueError(f"Unsupported reg_type: {reg_type}. Expected 'ewc' or 'incdet'.")
+        if self.incdet_beta <= 0:
+            raise ValueError(f"incdet_beta must be positive, got {incdet_beta}.")
         # if history_tasks is not None and len(history_tasks) > 0:
         #     print(f"==> [CatSegDetector] Reading {len(history_tasks)} history configs...")
         #     fisher_dict = torch.load(fisher_path, map_location='cpu') if fisher_path else None
@@ -164,6 +172,33 @@ class CatSegDetector(TwoStageDetector):
             print(f"==> [NSGP] Null-space projection enabled for {len(self.nsgp_neck_param_names)} neck weight params.")
 
         self.ortho_loss = SegOrthogonalLoss(loss_weight=1.0)
+
+    def _compute_param_regularization_loss(self):
+        if (not self.ewc_enable) or (not self.training):
+            return None
+
+        reg_loss = 0.0
+        current_params = dict(self.named_parameters())
+        for name, buf_name_old, buf_name_fisher in self.ewc_param_names:
+            current_p = current_params[name]
+            old_p = getattr(self, buf_name_old)
+            fisher_p = getattr(self, buf_name_fisher)
+            delta = current_p - old_p
+
+            if self.reg_type == 'ewc':
+                penalty = 0.5 * delta.pow(2)
+            else:
+                abs_delta = delta.abs()
+                beta = self.incdet_beta
+                penalty = torch.where(
+                    abs_delta <= beta,
+                    0.5 * delta.pow(2),
+                    beta * abs_delta - 0.5 * (beta ** 2)
+                )
+
+            reg_loss = reg_loss + (fisher_p * penalty).sum()
+
+        return reg_loss * self.ewc_weight
 
     def simple_test(self, img, img_metas, proposals=None, rescale=False):
         assert self.with_bbox, 'Bbox head must be implemented.'
@@ -417,15 +452,9 @@ class CatSegDetector(TwoStageDetector):
         if self.gda_enable and self.training:
             self._prepare_gda_from_losses(losses, res_feats, x)
 
-        # EWC
-        if self.ewc_enable and self.training:
-            ewc_loss = 0.0
-            current_params = dict(self.named_parameters())
-            for name, buf_name_old, buf_name_fisher in self.ewc_param_names:
-                current_p = current_params[name]
-                old_p = getattr(self, buf_name_old)
-                fisher_p = getattr(self, buf_name_fisher)
-                ewc_loss += (fisher_p * (current_p - old_p).pow(2)).sum()
-            losses['loss_ewc'] = ewc_loss * (self.ewc_weight / 2.0)
+        reg_loss = self._compute_param_regularization_loss()
+        if reg_loss is not None:
+            loss_name = 'loss_ewc' if self.reg_type == 'ewc' else 'loss_incdet'
+            losses[loss_name] = reg_loss
 
         return losses

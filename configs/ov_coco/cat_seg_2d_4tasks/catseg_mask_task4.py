@@ -12,32 +12,15 @@ class_weight = [
     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
 ]
 
-history_tasks = [
-    dict(
-        config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask.py',
-        weight_path='runs/cat-seg/test_train_task1_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 1 跑出来的权重绝对路径
-    ),
-    dict(
-        config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask_task2.py',
-        weight_path='runs/cat-seg/test_train_task2_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 2
-    ),
-    dict(
-        config_path='configs/ov_coco/cat_seg_2d_pseudolabel/catseg_mask_task3.py',
-        weight_path='runs/cat-seg/test_train_task3_10_2d_moe_sigmoid/epoch_20.pth' # ⭐ 填入你 Task 3
-    )
-]
 
 model = dict(
     type='CatSegDetector',
-
-    history_tasks=history_tasks,
-    fisher_path='fisher_task3.pth',
 
     backbone=dict(
         type='CatSegEvaCLIPViT',
         model_name='EVA02-CLIP-B-16',
         pretrained=None,
-        class_names='datasets/incremental_classes/task4_classes.json',
+        class_names='datasets/incremental_classes/task1234_classes.json',
         text_guidance_dim=512,
         text_guidance_proj_dim=128,
         appearance_guidance_dim=512,
@@ -212,7 +195,7 @@ checkpoint_config = dict(interval=10)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-load_from = 'runs/cat-seg/test_train_task3_10_2d_moe_sigmoid/epoch_20.pth'
+load_from = 'runs/cat-seg/ablation_ewc/test_train_task3_10_2d_moe_sigmoid/epoch_20.pth'
 resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0
@@ -276,7 +259,7 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=8,
+    samples_per_gpu=4,
     workers_per_gpu=8,
     train=dict(
         type=dataset_type,
@@ -306,6 +289,8 @@ data = dict(
 evaluation = dict(interval=1, metric=['bbox'])
 optimizer = dict(type='AdamW', lr=0.0004, betas=(0.9, 0.999), weight_decay=0.1)
 optimizer_config = dict(
+    type='GradientCumulativeOptimizerHook',
+    cumulative_iters=2,
     grad_clip=dict(max_norm=1.0, norm_type=2),
 )
 lr_config = dict(

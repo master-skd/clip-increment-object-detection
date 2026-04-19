@@ -14,8 +14,8 @@ model = dict(
     type='CatSegDetector',
 
     # history_tasks=history_tasks,
-    prev_model_path='runs/cat-seg/test_train_task2_10_2d_moe_sigmoid/epoch_20.pth',
-    fisher_path='fisher_task2.pth',
+    # prev_model_path='runs/cat-seg/test_train_task2_10_2d_moe_sigmoid/epoch_20.pth',
+    # fisher_path='fisher_task2.pth',
     
     backbone=dict(
         type='CatSegEvaCLIPViT',
@@ -193,7 +193,7 @@ checkpoint_config = dict(interval=5)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-load_from = 'runs/cat-seg/test_train_task2_10_2d_moe_sigmoid/epoch_20.pth'
+load_from = 'runs/cat-seg/ablation_ewc/test_train_task2_10_2d_moe_sigmoid/epoch_20.pth'
 resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0
@@ -257,7 +257,7 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=2,
+    samples_per_gpu=4,
     workers_per_gpu=8,
     train=dict(
         type=dataset_type,
@@ -287,6 +287,8 @@ data = dict(
 evaluation = dict(interval=1, metric=['bbox'])
 optimizer = dict(type='AdamW', lr=0.0004, betas=(0.9, 0.999), weight_decay=0.1)
 optimizer_config = dict(
+    type='GradientCumulativeOptimizerHook',
+    cumulative_iters=2,
     grad_clip=dict(max_norm=1.0, norm_type=2),
 )
 lr_config = dict(

@@ -4,10 +4,10 @@ import os
 
 # ================= Config =================
 FREE_MEM_REQUIRED_MB = 50 * 1024   # 每张卡至少空闲 60GB
-TARGET_GPUS = [0,1,2,3,4, 5, 6, 7]         # 只检测这八张卡
-MIN_GPUS = 8                       # 至少需要几张满足条件的卡
-MAX_GPUS = 8                       # 最终使用几张卡
-CHECK_INTERVAL = 60                # 检查间隔（秒）
+TARGET_GPUS = [0,1,2,3]         # 只检测这八张卡
+MIN_GPUS = 4                       # 至少需要几张满足条件的卡
+MAX_GPUS = 4                       # 最终使用几张卡
+CHECK_INTERVAL = 70                # 检查间隔（秒）
 LAUNCH_CMD = "bash incremental_train_val.sh"
 # ==========================================
 
